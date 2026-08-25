@@ -205,8 +205,21 @@ let with_span t ?parent name f =
   match f sp with
   | v -> emit `Ok; v
   | exception exn ->
-    emit (`Error (Printexc.to_string exn));
-    raise exn
+    let msg = Printexc.to_string exn in
+    (* emit itself can raise (only Eio.Cancel.Cancelled can escape safe_call
+       — see safe_call). If it does here, [exn] — the actual application
+       failure this span was closing on — would otherwise vanish with no
+       trace anywhere, unlike safe_call's normal path which always logs a
+       swallowed exception. Log it explicitly before letting Cancelled win,
+       so it's never silently lost. *)
+    (match emit (`Error msg) with
+     | ()               -> raise exn
+     | exception emit_exn ->
+       Printf.eprintf
+         "Obs_eio: with_span %S: application exception %s was about to \
+          close the span, but emit_span itself raised %s first\n%!"
+         name msg (Printexc.to_string emit_exn);
+       raise emit_exn)
 
 let log sp level ?(fields = []) message =
   if !(sp.sp_closed) then

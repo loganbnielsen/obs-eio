@@ -53,6 +53,10 @@ type span_event = {
   start_ns  : int64;  (** monotonic nanoseconds from [Eio.Time.Mono.now] *)
   end_ns    : int64;
   status    : [ `Ok | `Error of string ];
+  (** [`Error msg] carries only [Printexc.to_string exn] — no backtrace.
+      Deliberately minimal for v1: a backend wanting stack context would
+      need its own field for [Printexc.get_backtrace ()], which isn't
+      threaded through here. *)
   log_entries : log_entry list;
   (** Structured log entries from [log] calls within this span.
       Entries appear in call order. *)
@@ -138,10 +142,11 @@ val compose : backend -> backend -> backend
 (* ------------------------------------------------------------------ *)
 
 type t
-(** Safe to share across fibers in one domain — its mutable state is only
-    the backend closures you gave it, plus, transitively, whatever
-    [Obs_trace]'s ID generator uses (mutex-protected; see [Obs_trace]'s note
-    on that). Not tied to any particular span or request. *)
+(** Immutable and safe to share across fibers in one domain. Using it can
+    still reach mutable state, but none of it belongs to [t] itself: the
+    backend closures you gave it may close over whatever they like, and
+    [Obs_trace]'s ID generator is a mutex-protected process-global, not part
+    of any particular [t]. Not tied to any particular span or request. *)
 
 type span
 (** A [span] value is only valid for the extent of the [with_span] callback
@@ -181,6 +186,14 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
     [parent] is typically from [Obs_trace.extract_from_headers] on an incoming
     request — linking this span to the upstream trace. See [span]'s doc for
     the lifetime [span] values are valid for.
+
+    If the backend's own [emit_span] call raises [Eio.Cancel.Cancelled] while
+    closing the span (see [backend]'s doc), that takes priority over the
+    normal outcome: a successful [f]'s return value is discarded (cancellation
+    dominates, same as any other Eio operation racing a cancellation), and if
+    [f] itself raised first, that original exception is logged to stderr
+    before [Cancelled] propagates in its place — so it is never silently
+    lost, even though it isn't what the caller ultimately sees.
 
     There is no ambient/current-span mechanism: nesting is entirely manual.
     If code inside [f] calls another function that itself calls [with_span]

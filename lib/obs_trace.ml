@@ -43,6 +43,17 @@ let to_traceparent t =
   Printf.sprintf "00-%016Lx%016Lx-%016Lx-%02x"
     hi lo t.span_id (Char.code t.trace_flags)
 
+let is_hex_digit = function
+  | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
+  | _ -> false
+
+(* OCaml's Int64.of_string/int_of_string treat '_' as a digit-group
+   separator and happily parse e.g. "123456789abcde_f" as if the '_' were
+   not there — silently dropping a character instead of rejecting malformed
+   input. traceparent values come from arbitrary untrusted callers, so every
+   character must be checked to actually be hex before parsing. *)
+let is_hex_string s = String.for_all is_hex_digit s
+
 let of_traceparent s =
   match String.split_on_char '-' s with
   (* W3C forward compatibility: version "00" must be exactly these 4 fields
@@ -51,14 +62,15 @@ let of_traceparent s =
      trailing fields for a future version's own use, which are ignored —
      trace-id/parent-id/flags still live at these fixed positions. *)
   | version :: trace_hex :: span_hex :: flags_hex :: rest
-    when version <> "ff"
-      && String.length version = 2
+    when String.length version = 2
       && String.length trace_hex = 32
       && String.length span_hex  = 16
       && String.length flags_hex = 2
+      && is_hex_string version && is_hex_string trace_hex
+      && is_hex_string span_hex && is_hex_string flags_hex
+      && String.lowercase_ascii version <> "ff"
       && (version <> "00" || rest = []) ->
     (try
-       let _  = int_of_string ("0x" ^ version) in
        let hi = Int64.of_string ("0x" ^ String.sub trace_hex  0 16) in
        let lo = Int64.of_string ("0x" ^ String.sub trace_hex 16 16) in
        let si = Int64.of_string ("0x" ^ span_hex) in

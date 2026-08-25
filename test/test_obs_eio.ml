@@ -34,6 +34,38 @@ let capture_stdout f =
     Unix.close read_fd;
     raise exn
 
+let capture_stderr f =
+  let old_stderr = Unix.dup Unix.stderr in
+  let read_fd, write_fd = Unix.pipe () in
+  Unix.dup2 write_fd Unix.stderr;
+  Unix.close write_fd;
+  let restored = ref false in
+  let restore () =
+    if not !restored then begin
+      Unix.dup2 old_stderr Unix.stderr;
+      Unix.close old_stderr;
+      restored := true
+    end
+  in
+  match f () with
+  | result ->
+    flush Stdlib.stderr;
+    restore ();
+    let ic = Unix.in_channel_of_descr read_fd in
+    let buf = Buffer.create 128 in
+    (try
+       while true do
+         Buffer.add_string buf (input_line ic);
+         Buffer.add_char buf '\n'
+       done
+     with End_of_file -> ());
+    close_in ic;
+    (result, Buffer.contents buf)
+  | exception exn ->
+    restore ();
+    Unix.close read_fd;
+    raise exn
+
 (* ------------------------------------------------------------------ *)
 (* Obs_trace                                                           *)
 (* ------------------------------------------------------------------ *)
@@ -60,7 +92,15 @@ let test_of_traceparent_malformed () =
        "ff-00000000000000000000000000000001-0000000000000001-01" = None);
   Alcotest.(check bool) "version \"00\" with an extra trailing field" true
     (Obs_trace.of_traceparent
-       "00-00000000000000000000000000000001-0000000000000001-01-extra" = None)
+       "00-00000000000000000000000000000001-0000000000000001-01-extra" = None);
+  Alcotest.(check bool) "reserved invalid version \"FF\" (uppercase)" true
+    (Obs_trace.of_traceparent
+       "FF-00000000000000000000000000000001-0000000000000001-01" = None);
+  (* Int64.of_string/int_of_string treat '_' as a digit-group separator and
+     would otherwise silently drop it instead of rejecting the header. *)
+  Alcotest.(check bool) "underscore in span-id hex is rejected, not silently dropped"
+    true (Obs_trace.of_traceparent
+            "00-00000000000000000000000000000001-123456789abcde_f-01" = None)
 
 let test_of_traceparent_forward_compatible_version () =
   (* A future version ("01" here) may append trailing fields of its own;
@@ -697,6 +737,28 @@ let test_with_span_propagates_cancelled () =
   | ()                              -> Alcotest.fail "Cancelled should have propagated, not been swallowed"
   | exception Eio.Cancel.Cancelled _ -> ()
 
+let test_with_span_logs_original_exception_lost_to_cancelled () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  (* Double fault: the application body fails with an ordinary exception,
+     and closing the span (emit_span) then also raises Cancelled instead of
+     returning. Cancelled must win (it's what the caller sees), but the
+     original application failure must not vanish with no trace at all — it
+     has to be logged before Cancelled takes over. *)
+  let (result, stderr_output) =
+    capture_stderr (fun () ->
+      match Obs_eio.with_span ot "op" (fun _sp -> failwith "original failure") with
+      | ()                                -> `Wrong_return
+      | exception Eio.Cancel.Cancelled _ -> `Cancelled_propagated
+      | exception (Failure _)             -> `Wrong_original_exn_leaked)
+  in
+  Alcotest.(check bool) "Cancelled is what the caller sees"
+    true (result = `Cancelled_propagated);
+  Alcotest.(check bool) "the original failure was logged, not silently dropped"
+    true (contains_substring stderr_output "original failure")
+
 let test_compose_propagates_cancelled_and_skips_sibling () =
   Eio_main.run @@ fun env ->
   let spans_b = ref 0 in
@@ -776,6 +838,7 @@ let () =
       test_case "register_counter survives a raising backend" `Quick test_register_counter_survives_raising_backend;
       test_case "register survives a raising declare_metric"  `Quick test_register_survives_raising_declare;
       test_case "with_span propagates Cancelled instead of swallowing it" `Quick test_with_span_propagates_cancelled;
+      test_case "with_span logs an application exception lost to a racing Cancelled" `Quick test_with_span_logs_original_exception_lost_to_cancelled;
       test_case "compose propagates Cancelled and skips the sibling"      `Quick test_compose_propagates_cancelled_and_skips_sibling;
     ];
   ]
