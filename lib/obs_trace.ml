@@ -2,20 +2,28 @@ type t = {
   trace_id    : int64 * int64;
   span_id     : int64;
   trace_flags : char;
-  baggage     : (string * string) list;
 }
 
 (* Self-seeded so trace/span IDs don't collide across process restarts —
    unlike the global Random module, this needs no Random.self_init () call
-   from the caller (easy to forget, and silently falls back to a fixed seed). *)
+   from the caller (easy to forget, and silently falls back to a fixed seed).
+   [bits64] (not [int64 rng_state Int64.max_int]) so every bit is uniformly
+   random — [int64 _ Int64.max_int] can never set the top bit, silently
+   halving the ID space. Mutex-protected: Random.State.t mutation is not
+   domain-safe, and this state is process-wide, reachable from any domain
+   that calls [generate]/[child_span]. *)
 let rng_state = Random.State.make_self_init ()
-let random_int64 () = Random.State.int64 rng_state Int64.max_int
+let rng_mutex = Mutex.create ()
+
+let random_int64 () =
+  Mutex.lock rng_mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock rng_mutex)
+    (fun () -> Random.State.bits64 rng_state)
 
 let generate () = {
   trace_id    = (random_int64 (), random_int64 ());
   span_id     = random_int64 ();
   trace_flags = '\x01';  (* sampled *)
-  baggage     = [];
 }
 
 let child_span t = { t with span_id = random_int64 () }
@@ -47,7 +55,7 @@ let of_traceparent s =
        let lo = Int64.of_string ("0x" ^ String.sub trace_hex 16 16) in
        let si = Int64.of_string ("0x" ^ span_hex) in
        let fl = Char.chr (int_of_string ("0x" ^ flags_hex)) in
-       Some { trace_id = (hi, lo); span_id = si; trace_flags = fl; baggage = [] }
+       Some { trace_id = (hi, lo); span_id = si; trace_flags = fl }
      with _ -> None)
   | _ -> None
 

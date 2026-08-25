@@ -31,12 +31,15 @@ dependencies to test against.
 
 ### `Obs_trace`
 
+Deliberately minimal: carries just enough to serialize/parse the W3C `traceparent`
+header and derive child spans. No baggage, no tracestate, no vendor extensions — wrap
+`t` in your own type if you need those.
+
 ```ocaml
 type t = {
   trace_id    : int64 * int64;
   span_id     : int64;
   trace_flags : char;
-  baggage     : (string * string) list;
 }
 
 val generate         : unit -> t               (* new root context *)
@@ -47,10 +50,11 @@ val extract_from_headers : (string * string) list -> t option
 val inject_to_headers    : t -> (string * string) list -> (string * string) list
 ```
 
-`generate`'s randomness is a self-seeded PRNG state private to this module — no caller
-`Random.self_init ()` call needed, and no risk of every process sharing the stdlib
-`Random` module's fixed default seed. Not cryptographically strong; fine for correlation
-and collision-avoidance, not for anything security-sensitive.
+`generate`'s randomness is a self-seeded, mutex-protected PRNG state private to this
+module — no caller `Random.self_init ()` call needed, no risk of every process sharing
+the stdlib `Random` module's fixed default seed, and safe to call concurrently from
+multiple OCaml 5 domains. Not cryptographically strong; fine for correlation and
+collision-avoidance, not for anything security-sensitive.
 
 ### `Obs` — metric emitter types
 
@@ -78,24 +82,37 @@ type span_event = {
   start_ns    : int64;
   end_ns      : int64;
   status      : [ `Ok | `Error of string ];
-  fields      : (string * string) list;
   log_entries : log_entry list;
   context     : (string * string) list;
 }
 
+type metric_decl = {
+  decl_name        : string;
+  decl_help        : string;
+  decl_kind        : [ `Counter | `Gauge | `Histogram ];
+  decl_label_names : string list;
+  decl_service     : string;
+}
+(* Registration-time metadata, delivered to [backend.declare_metric] once per
+   [register_*] call, before the first [emit_metric] for that family — possibly
+   before any. A backend that wants a metric visible (e.g. at its zero value) as
+   soon as it's registered rather than only after its first observation uses this;
+   a log/trace-only backend ignores it. *)
+
 type backend = {
-  emit_span   : span_event   -> unit;
-  emit_metric : metric_event -> unit;
+  emit_span      : span_event   -> unit;
+  emit_metric    : metric_event -> unit;
+  declare_metric : metric_decl  -> unit;
 }
 (* A caller-supplied backend may raise; callers of [with_span], [log_t], and the
-   [register_*] emitters never see that exception — it is caught and logged to
-   stderr, so a broken backend cannot crash application code. *)
+   [register_*] emitters/declarations never see that exception — it is caught and
+   logged to stderr, so a broken backend cannot crash application code. *)
 
 val noop    : backend   (* drops everything *)
 val stdout  : backend   (* pretty-prints to stdout *)
 val compose : backend -> backend -> backend
-(* [compose a b] fans out to two backends. Each backend's emit calls are isolated:
-   if one raises, the other still receives the event. *)
+(* [compose a b] fans out to two backends. Each backend's emit/declare calls are
+   isolated: if one raises, the other still receives the event. *)
 
 val create
   :  service:string
@@ -107,7 +124,10 @@ val with_context : t -> (string * string) list -> t
 
 val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
 
-val log             : span -> level -> ?fields:(string * string) list -> string -> unit
+val log   : span -> level -> ?fields:(string * string) list -> string -> unit
+(* Raises [Invalid_argument] once [span]'s [with_span] callback has returned —
+   see Design Notes below on [span]'s lifetime. *)
+val log_t : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
 val current_trace_ctx : span -> Obs_trace.t
 
 val register_counter   : t -> name:string -> help:string -> label_names:string list -> counter_fn
@@ -124,29 +144,29 @@ there is no per-metric override.
 ## Example Usage
 
 ```ocaml
-let ot = Obs.create ~service:"payments-worker"
+let ot = Obs.create ~service:"checkout-api"
            ~mono_clock:env#mono_clock ~backend:Obs.stdout in
 let ot = Obs.with_context ot [("env", "prod"); ("region", "us-east-1")] in
 
 (* Register metrics once at startup *)
-let msgs_ok = Obs.register_counter ot
-  ~name:"kafka_messages_processed_total"
-  ~help:"Total messages processed"
-  ~label_names:["topic"; "status"] in
+let requests_total = Obs.register_counter ot
+  ~name:"http_requests_total"
+  ~help:"Total HTTP requests handled"
+  ~label_names:["route"; "status"] in
 
-(* Per-message handler *)
-let handle raw_msg =
-  let parent = Obs_trace.extract_from_headers raw_msg.headers in
-  Obs.with_span ot ?parent "payment.process" (fun sp ->
-    let ot = Obs.with_context ot [("payment_id", raw_msg.id)] in
-    Obs.log sp Obs.Info ~fields:[("amount_cents", "9900")] "processing payment";
+(* Per-request handler *)
+let handle_request req =
+  let parent = Obs_trace.extract_from_headers req.headers in
+  Obs.with_span ot ?parent "handle_request" (fun sp ->
+    let ot = Obs.with_context ot [("request_id", req.id)] in
+    Obs.log sp Obs.Info ~fields:[("route", req.route)] "handling request";
     (* ... business logic ... *)
-    msgs_ok ~labels:[("topic", "payments"); ("status", "ok")] 1;
-    (* propagate trace to downstream Kafka message *)
+    requests_total ~labels:[("route", req.route); ("status", "200")] 1;
+    (* propagate trace to a downstream call *)
     let headers = Obs_trace.inject_to_headers (Obs.current_trace_ctx sp) [] in
     ignore (ot, headers))
 in
-ignore handle
+ignore handle_request
 ```
 
 ## Design Notes
@@ -154,13 +174,16 @@ ignore handle
 - **Immutable context**: `with_context` returns a new `t`. The original is unchanged, so it is safe to pass the same `ot` to multiple concurrent fibers and derive per-fiber scoped copies.
 - **Monotonic time**: `span_event.start_ns` and `end_ns` use `Mtime.to_uint64_ns` on `Eio.Time.Mono.now` — unaffected by NTP corrections.
 - **OTel-compatible tracing**: `Obs_trace.t` carries W3C `traceparent`-compatible fields. `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
-- **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures. A backend uses the registration metadata (name, help, label names) to declare metric families before first emission.
+- **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures, after synchronously delivering a `metric_decl` to the backend's `declare_metric` — so a backend can make a metric visible (e.g. at its zero value) as soon as it's registered, not only after its first observation.
 - **Backend composition**: `compose a b` fans out to two backends — use for e.g. `compose prometheus_backend loki_backend`.
-- **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_t`, and the `register_*` emitters catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other.
+- **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_t`, and the `register_*` emitters/declarations catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other.
+- **Span lifetime**: a `span` value is only valid for the extent of the `with_span` callback it was handed to — `log` raises `Invalid_argument` once that callback has returned, so stashing a `span` in a ref or a fiber/domain that outlives the callback fails loudly instead of silently discarding log entries. Open a new `with_span` inside that fiber/domain instead of reusing the outer one.
+- **Single-domain `t`**: `t` is safe to share across fibers within one domain. `Obs_trace`'s ID generator is safe across domains (mutex-protected); a `span`'s log buffer is not meant to be written from more than one domain.
 
 ## Out of Scope
 
 - Backend implementations — see `obs-loki-eio`, `obs-prometheus-eio`, and any future backend package
 - Grafana dashboard templates
-- Baggage propagation — `Obs_trace.t.baggage` is preserved across `inject_to_headers` / `extract_from_headers` but not exposed in the v1 API
+- Baggage, tracestate, and other W3C extensions beyond `traceparent` — wrap `Obs_trace.t` in your own type if you need them
 - Sampling decisions — `trace_flags` is set to `\x01` (sampled) by default; a sampling API is deferred
+- Detecting a metric re-registered under the same name with a different label set — each `t`'s `register_*` calls are independent closures with no cross-registration registry at this layer (a backend such as `obs-prometheus-eio` may detect some of this itself)

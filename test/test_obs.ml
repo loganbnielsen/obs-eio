@@ -1,6 +1,6 @@
 (** Unit tests for obs-eio. No broker required. *)
 
-let () = Random.init 42  (* deterministic trace IDs *)
+let noop_declare = (fun (_ : Obs.metric_decl) -> ())
 
 (* ------------------------------------------------------------------ *)
 (* Obs_trace                                                           *)
@@ -82,6 +82,17 @@ let test_inject_replaces_existing_case_insensitive () =
   | None      -> Alcotest.fail "extract returned None"
   | Some ctx3 -> Alcotest.(check bool) "latest wins" true (ctx2.span_id = ctx3.span_id)
 
+let test_generate_uses_full_64_bits () =
+  (* Random.State.int64 rng_state Int64.max_int would make the top bit of
+     every id always 0 (never in [0x8000000000000000, 0xffffffffffffffff]).
+     Generate enough ids that seeing at least one with the top bit set is
+     overwhelmingly likely if the fix is in place, and impossible if it
+     regresses back to the old biased generator. *)
+  let top_bit_set id = Int64.compare id 0L < 0 in
+  let ids = List.init 200 (fun _ -> (Obs_trace.generate ()).span_id) in
+  Alcotest.(check bool) "at least one span_id has the top bit set"
+    true (List.exists top_bit_set ids)
+
 (* ------------------------------------------------------------------ *)
 (* Context                                                             *)
 (* ------------------------------------------------------------------ *)
@@ -91,7 +102,8 @@ let test_with_context_merges () =
   let last_ctx = ref [] in
   let backend = {
     Obs.emit_span   = (fun _ -> ());
-    Obs.emit_metric = (fun e -> last_ctx := e.Obs.context);
+    emit_metric      = (fun e -> last_ctx := e.Obs.context);
+    declare_metric   = noop_declare;
   } in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend in
   let ot = Obs.with_context ot [("env", "prod"); ("region", "us-east-1")] in
@@ -108,7 +120,8 @@ let test_with_context_immutable () =
   let ctxs = ref [] in
   let backend = {
     Obs.emit_span   = (fun _ -> ());
-    Obs.emit_metric = (fun e -> ctxs := e.Obs.context :: !ctxs);
+    emit_metric      = (fun e -> ctxs := e.Obs.context :: !ctxs);
+    declare_metric   = noop_declare;
   } in
   let ot  = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend in
   let ot1 = Obs.with_context ot  [("req", "a")] in
@@ -131,7 +144,8 @@ let test_span_emitted () =
   let spans = ref [] in
   let backend = {
     Obs.emit_span   = (fun e -> spans := e :: !spans);
-    Obs.emit_metric = (fun _ -> ());
+    emit_metric      = (fun _ -> ());
+    declare_metric   = noop_declare;
   } in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend in
   Obs.with_span ot "do_work" (fun _sp -> ());
@@ -146,7 +160,7 @@ let test_span_ok_status () =
   let spans = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
-               emit_metric = (fun _ -> ()) } in
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   Obs.with_span ot "op" (fun _sp -> ());
   Alcotest.(check bool) "ok status"
     true (match (List.hd !spans).Obs.status with `Ok -> true | _ -> false)
@@ -156,7 +170,7 @@ let test_span_error_status_on_exception () =
   let spans = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
-               emit_metric = (fun _ -> ()) } in
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   (try Obs.with_span ot "boom" (fun _sp -> raise Exit) with Exit -> ());
   Alcotest.(check bool) "error status on exception"
     true (match (List.hd !spans).Obs.status with `Error _ -> true | _ -> false)
@@ -166,12 +180,11 @@ let test_log_appends_to_span () =
   let spans = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
-               emit_metric = (fun _ -> ()) } in
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   Obs.with_span ot "op" (fun sp ->
     Obs.log sp Obs.Info ~fields:[("key", "val")] "first";
     Obs.log sp Obs.Warn "second");
   let span = List.hd !spans in
-  Alcotest.(check (list (pair string string))) "span fields stay empty" [] span.Obs.fields;
   let entries = span.Obs.log_entries in
   Alcotest.(check int) "two log entries" 2 (List.length entries);
   (match entries with
@@ -189,13 +202,25 @@ let test_log_order_preserved () =
   let spans = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
-               emit_metric = (fun _ -> ()) } in
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   Obs.with_span ot "op" (fun sp ->
     Obs.log sp Obs.Info "first";
     Obs.log sp Obs.Info "second");
   let msgs = (List.hd !spans).Obs.log_entries
     |> List.map (fun entry -> entry.Obs.message) in
   Alcotest.(check (list string)) "call order preserved" ["first"; "second"] msgs
+
+let test_log_after_close_raises () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend:Obs.noop in
+  let escaped = ref None in
+  Obs.with_span ot "op" (fun sp -> escaped := Some sp);
+  match !escaped with
+  | None -> Alcotest.fail "span was not captured"
+  | Some sp ->
+    (match Obs.log sp Obs.Info "too late" with
+     | ()                        -> Alcotest.fail "log on a closed span should raise"
+     | exception Invalid_argument _ -> ())
 
 let test_current_trace_ctx_child_of_parent () =
   Eio_main.run @@ fun env ->
@@ -213,11 +238,22 @@ let test_with_span_no_parent_generates_root () =
   let spans = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
-               emit_metric = (fun _ -> ()) } in
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   Obs.with_span ot "root" (fun _sp -> ());
   let tp = Obs_trace.to_traceparent (List.hd !spans).Obs.trace_ctx in
   Alcotest.(check bool) "valid traceparent"
     true (Obs_trace.of_traceparent tp <> None)
+
+let test_log_t_uses_parent () =
+  Eio_main.run @@ fun env ->
+  let spans = ref [] in
+  let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs.emit_span = (fun e -> spans := e :: !spans);
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  let parent = Obs_trace.generate () in
+  Obs.log_t ot ~parent Obs.Info "standalone log";
+  Alcotest.(check bool) "log_t's span shares the parent trace_id"
+    true (parent.Obs_trace.trace_id = (List.hd !spans).Obs.trace_ctx.Obs_trace.trace_id)
 
 (* ------------------------------------------------------------------ *)
 (* Metrics                                                             *)
@@ -228,7 +264,8 @@ let test_counter_emits_event () =
   let metrics = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun _ -> ());
-               emit_metric = (fun e -> metrics := e :: !metrics) } in
+               emit_metric = (fun e -> metrics := e :: !metrics);
+               declare_metric = noop_declare } in
   let c = Obs.register_counter ot ~name:"reqs" ~help:"desc" ~label_names:["method"] in
   c ~labels:[("method", "POST")] 1;
   Alcotest.(check int)    "one event"   1     (List.length !metrics);
@@ -244,7 +281,8 @@ let test_histogram_emits_event () =
   let metrics = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun _ -> ());
-               emit_metric = (fun e -> metrics := e :: !metrics) } in
+               emit_metric = (fun e -> metrics := e :: !metrics);
+               declare_metric = noop_declare } in
   let h = Obs.register_histogram ot ~name:"latency_ms" ~help:"desc" ~label_names:[] in
   h 42.5;
   Alcotest.(check bool) "is histogram"
@@ -255,7 +293,8 @@ let test_counter_and_histogram_helper_emits_both () =
   let metrics = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun _ -> ());
-               emit_metric = (fun e -> metrics := e :: !metrics) } in
+               emit_metric = (fun e -> metrics := e :: !metrics);
+               declare_metric = noop_declare } in
   let c, h =
     Obs.register_counter_and_histogram ot
       ~counter_name:"items_total"
@@ -281,7 +320,8 @@ let test_emit_accepts_declared_labels_any_order () =
   let metrics = ref [] in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun _ -> ());
-               emit_metric = (fun e -> metrics := e :: !metrics) } in
+               emit_metric = (fun e -> metrics := e :: !metrics);
+               declare_metric = noop_declare } in
   let g =
     Obs.register_gauge ot
       ~name:"http_inflight_requests" ~help:"desc"
@@ -299,7 +339,8 @@ let test_emit_rejects_missing_extra_duplicate_labels () =
   let emitted = ref 0 in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs.emit_span = (fun _ -> ());
-               emit_metric = (fun _ -> incr emitted) } in
+               emit_metric = (fun _ -> incr emitted);
+               declare_metric = noop_declare } in
   let c =
     Obs.register_counter ot
       ~name:"http_requests_total" ~help:"desc"
@@ -359,7 +400,10 @@ let test_register_rejects_invalid_metric_name () =
     in
     ());
   check_invalid_arg "invalid histogram name" (fun () ->
-    Obs.register_histogram ot ~name:"bad.name" ~help:"desc" ~label_names:[] 1.0)
+    let _emit : Obs.histogram_fn =
+      Obs.register_histogram ot ~name:"bad.name" ~help:"desc" ~label_names:[]
+    in
+    ())
 
 let test_register_rejects_invalid_label_name () =
   Eio_main.run @@ fun env ->
@@ -377,10 +421,12 @@ let test_register_rejects_invalid_label_name () =
     in
     ());
   check_invalid_arg "invalid histogram label" (fun () ->
-    Obs.register_histogram ot
-      ~name:"request_duration_seconds" ~help:"desc"
-      ~label_names:["bad.label"]
-      1.0)
+    let _emit : Obs.histogram_fn =
+      Obs.register_histogram ot
+        ~name:"request_duration_seconds" ~help:"desc"
+        ~label_names:["bad.label"]
+    in
+    ())
 
 let test_register_rejects_duplicate_label_names () =
   Eio_main.run @@ fun env ->
@@ -397,7 +443,8 @@ let test_register_counter_rejects_negative_delta () =
   Eio_main.run @@ fun env ->
   let emitted = ref 0 in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
-    ~backend:{ Obs.emit_span = (fun _ -> ()); emit_metric = (fun _ -> incr emitted) } in
+    ~backend:{ Obs.emit_span = (fun _ -> ()); emit_metric = (fun _ -> incr emitted);
+               declare_metric = noop_declare } in
   let c = Obs.register_counter ot ~name:"reqs_total" ~help:"desc" ~label_names:[] in
   check_invalid_arg "negative counter delta" (fun () -> c (-1));
   Alcotest.(check int) "backend not called for negative delta" 0 !emitted
@@ -412,6 +459,31 @@ let test_register_histogram_rejects_le_label () =
         ~label_names:["le"]
     in
     ())
+
+let test_register_declares_before_first_emit () =
+  Eio_main.run @@ fun env ->
+  let declared = ref [] and emitted = ref 0 in
+  let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs.emit_span = (fun _ -> ());
+               emit_metric = (fun _ -> incr emitted);
+               declare_metric = (fun d -> declared := d :: !declared) } in
+  let c =
+    Obs.register_counter ot
+      ~name:"reqs_total" ~help:"Total requests" ~label_names:["route"]
+  in
+  Alcotest.(check int) "declared exactly once, before any emit"
+    1 (List.length !declared);
+  Alcotest.(check int) "not emitted yet" 0 !emitted;
+  (match !declared with
+   | [d] ->
+     Alcotest.(check string) "declared name" "reqs_total" d.Obs.decl_name;
+     Alcotest.(check string) "declared help" "Total requests" d.Obs.decl_help;
+     Alcotest.(check bool)   "declared kind is Counter"
+       true (d.Obs.decl_kind = `Counter);
+     Alcotest.(check (list string)) "declared label names" ["route"] d.Obs.decl_label_names
+   | _ -> Alcotest.fail "expected exactly one declaration");
+  c ~labels:[("route", "/")] 1;
+  Alcotest.(check int) "emitted once after use" 1 !emitted
 
 let test_noop_compiles_and_runs () =
   Eio_main.run @@ fun env ->
@@ -428,8 +500,10 @@ let test_noop_compiles_and_runs () =
 let test_compose_fans_out () =
   Eio_main.run @@ fun env ->
   let spans_a = ref 0 and spans_b = ref 0 in
-  let backend_a = { Obs.emit_span = (fun _ -> incr spans_a); emit_metric = (fun _ -> ()) } in
-  let backend_b = { Obs.emit_span = (fun _ -> incr spans_b); emit_metric = (fun _ -> ()) } in
+  let backend_a = { Obs.emit_span = (fun _ -> incr spans_a); emit_metric = (fun _ -> ());
+                     declare_metric = noop_declare } in
+  let backend_b = { Obs.emit_span = (fun _ -> incr spans_b); emit_metric = (fun _ -> ());
+                     declare_metric = noop_declare } in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:(Obs.compose backend_a backend_b) in
   Obs.with_span ot "op" (fun _sp -> ());
@@ -438,32 +512,48 @@ let test_compose_fans_out () =
 
 let test_compose_isolates_a_raising_sibling () =
   Eio_main.run @@ fun env ->
-  let spans_b = ref 0 and metrics_b = ref 0 in
+  let spans_b = ref 0 and metrics_b = ref 0 and declares_b = ref 0 in
   let backend_a =
-    { Obs.emit_span = (fun _ -> failwith "boom span"); emit_metric = (fun _ -> failwith "boom metric") } in
+    { Obs.emit_span = (fun _ -> failwith "boom span");
+      emit_metric = (fun _ -> failwith "boom metric");
+      declare_metric = (fun _ -> failwith "boom declare") } in
   let backend_b =
-    { Obs.emit_span = (fun _ -> incr spans_b); emit_metric = (fun _ -> incr metrics_b) } in
+    { Obs.emit_span = (fun _ -> incr spans_b);
+      emit_metric = (fun _ -> incr metrics_b);
+      declare_metric = (fun _ -> incr declares_b) } in
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:(Obs.compose backend_a backend_b) in
   Obs.with_span ot "op" (fun _sp -> ());
   let c = Obs.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   c 1;
   Alcotest.(check int) "sibling still received span despite a's exception" 1 !spans_b;
-  Alcotest.(check int) "sibling still received metric despite a's exception" 1 !metrics_b
+  Alcotest.(check int) "sibling still received metric despite a's exception" 1 !metrics_b;
+  Alcotest.(check int) "sibling still received declare despite a's exception" 1 !declares_b
 
 let test_with_span_survives_raising_backend () =
   Eio_main.run @@ fun env ->
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
-    ~backend:{ Obs.emit_span = (fun _ -> failwith "boom"); emit_metric = (fun _ -> ()) } in
+    ~backend:{ Obs.emit_span = (fun _ -> failwith "boom"); emit_metric = (fun _ -> ());
+               declare_metric = noop_declare } in
   (* Must not raise: a broken backend cannot crash application code. *)
   Obs.with_span ot "op" (fun _sp -> ())
 
 let test_register_counter_survives_raising_backend () =
   Eio_main.run @@ fun env ->
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
-    ~backend:{ Obs.emit_span = (fun _ -> ()); emit_metric = (fun _ -> failwith "boom") } in
+    ~backend:{ Obs.emit_span = (fun _ -> ()); emit_metric = (fun _ -> failwith "boom");
+               declare_metric = noop_declare } in
   let c = Obs.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   (* Must not raise. *)
+  c 1
+
+let test_register_survives_raising_declare () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs.emit_span = (fun _ -> ()); emit_metric = (fun _ -> ());
+               declare_metric = (fun _ -> failwith "boom") } in
+  (* Must not raise: registration itself must survive a broken backend too. *)
+  let c = Obs.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   c 1
 
 (* ------------------------------------------------------------------ *)
@@ -482,6 +572,7 @@ let () =
       test_case "extract mixed-case header"       `Quick test_extract_headers_case_insensitive;
       test_case "inject replaces mixed-case header" `Quick
         test_inject_replaces_existing_case_insensitive;
+      test_case "generated ids use the full 64 bits" `Quick test_generate_uses_full_64_bits;
     ];
     "context", [
       test_case "with_context merges and overrides" `Quick test_with_context_merges;
@@ -493,8 +584,10 @@ let () =
       test_case "error status on exception"       `Quick test_span_error_status_on_exception;
       test_case "log appends entries to span"     `Quick test_log_appends_to_span;
       test_case "log order preserved"             `Quick test_log_order_preserved;
+      test_case "log after close raises"          `Quick test_log_after_close_raises;
       test_case "current_trace_ctx child of parent" `Quick test_current_trace_ctx_child_of_parent;
       test_case "root span has valid traceparent" `Quick test_with_span_no_parent_generates_root;
+      test_case "log_t uses ?parent"               `Quick test_log_t_uses_parent;
     ];
     "metrics", [
       test_case "counter emits metric event"   `Quick test_counter_emits_event;
@@ -509,6 +602,7 @@ let () =
       test_case "register rejects duplicate label names" `Quick test_register_rejects_duplicate_label_names;
       test_case "register_counter rejects negative delta" `Quick test_register_counter_rejects_negative_delta;
       test_case "register_histogram rejects \"le\" label" `Quick test_register_histogram_rejects_le_label;
+      test_case "register declares before first emit" `Quick test_register_declares_before_first_emit;
       test_case "noop backend runs silently"   `Quick test_noop_compiles_and_runs;
     ];
     "compose", [
@@ -518,5 +612,6 @@ let () =
     "backend_failure_isolation", [
       test_case "with_span survives a raising backend"        `Quick test_with_span_survives_raising_backend;
       test_case "register_counter survives a raising backend" `Quick test_register_counter_survives_raising_backend;
+      test_case "register survives a raising declare_metric"  `Quick test_register_survives_raising_declare;
     ];
   ]

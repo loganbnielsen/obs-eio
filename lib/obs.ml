@@ -21,7 +21,6 @@ type span_event = {
   start_ns  : int64;
   end_ns    : int64;
   status    : [ `Ok | `Error of string ];
-  fields    : (string * string) list;
   log_entries : log_entry list;
   context   : (string * string) list;
 }
@@ -35,9 +34,18 @@ type metric_event = {
   service : string;
 }
 
+type metric_decl = {
+  decl_name        : string;
+  decl_help        : string;
+  decl_kind        : [ `Counter | `Gauge | `Histogram ];
+  decl_label_names : string list;
+  decl_service     : string;
+}
+
 type backend = {
-  emit_span   : span_event   -> unit;
-  emit_metric : metric_event -> unit;
+  emit_span      : span_event   -> unit;
+  emit_metric    : metric_event -> unit;
+  declare_metric : metric_decl  -> unit;
 }
 
 type label_name = string
@@ -55,12 +63,11 @@ type t = {
 
 type span = {
   sp_ctx     : Obs_trace.t;
-  sp_name    : string;
-  sp_service : string;
-  sp_start   : int64;
   (* Accumulates log entries in reverse call order. *)
   sp_log_buf : log_entry list ref;
-  sp_ot      : t;
+  (* Set once [with_span]'s callback returns; [log] rejects a closed span
+     rather than silently buffering into an entry nothing will ever read. *)
+  sp_closed  : bool ref;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -84,8 +91,9 @@ let log_entries_fields entries =
 (* ------------------------------------------------------------------ *)
 
 let noop = {
-  emit_span   = (fun _ -> ());
-  emit_metric = (fun _ -> ());
+  emit_span      = (fun _ -> ());
+  emit_metric    = (fun _ -> ());
+  declare_metric = (fun _ -> ());
 }
 
 let pp_kv pairs =
@@ -99,7 +107,7 @@ let stdout =
   { emit_span = (fun e ->
       let dur_ms = Int64.(to_float (sub e.end_ns e.start_ns)) /. 1e6 in
       let status = match e.status with `Ok -> "ok" | `Error s -> "error:" ^ s in
-      let fields = e.fields @ log_entries_fields e.log_entries in
+      let fields = log_entries_fields e.log_entries in
       Printf.printf "SPAN  svc=%s name=%s %s status=%s dur=%.2fms%s\n%!"
         e.service e.name (pp_trace e.trace_ctx) status dur_ms
         (if fields = [] then "" else " | " ^ pp_kv fields));
@@ -113,6 +121,7 @@ let stdout =
         e.service e.name kind
         (if e.labels  = [] then "" else " labels={" ^ pp_kv e.labels ^ "}")
         (if e.context = [] then "" else " ctx={"    ^ pp_kv e.context ^ "}"));
+    declare_metric = (fun _ -> ());
   }
 
 (* A backend is caller-supplied and may be buggy; isolate its failures so
@@ -123,12 +132,15 @@ let safe_call ~what f =
     Printf.eprintf "Obs: backend %s raised: %s\n%!" what (Printexc.to_string exn)
 
 let compose a b = {
-  emit_span   = (fun e ->
-    safe_call ~what:"emit_span"   (fun () -> a.emit_span e);
-    safe_call ~what:"emit_span"   (fun () -> b.emit_span e));
-  emit_metric = (fun e ->
-    safe_call ~what:"emit_metric" (fun () -> a.emit_metric e);
-    safe_call ~what:"emit_metric" (fun () -> b.emit_metric e));
+  emit_span      = (fun e ->
+    safe_call ~what:"emit_span"      (fun () -> a.emit_span e);
+    safe_call ~what:"emit_span"      (fun () -> b.emit_span e));
+  emit_metric    = (fun e ->
+    safe_call ~what:"emit_metric"    (fun () -> a.emit_metric e);
+    safe_call ~what:"emit_metric"    (fun () -> b.emit_metric e));
+  declare_metric = (fun d ->
+    safe_call ~what:"declare_metric" (fun () -> a.declare_metric d);
+    safe_call ~what:"declare_metric" (fun () -> b.declare_metric d));
 }
 
 (* ------------------------------------------------------------------ *)
@@ -163,19 +175,18 @@ let with_span t ?parent name f =
     | Some p -> Obs_trace.child_span p
   in
   let sp_start = now_ns t in
-  let sp = { sp_ctx; sp_name = name; sp_service = t.service;
-             sp_start; sp_log_buf = ref []; sp_ot = t } in
+  let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false } in
   let outcome = ref `Ok in
   Fun.protect
     ~finally:(fun () ->
       let end_ns = now_ns t in
       let log_entries = List.rev !(sp.sp_log_buf) in
+      sp.sp_closed := true;
       safe_call ~what:"emit_span" (fun () ->
         t.backend.emit_span {
           trace_ctx = sp_ctx; name; service = t.service;
           start_ns = sp_start; end_ns;
           status = !outcome;
-          fields = [];
           log_entries;
           context = t.context;
         }))
@@ -187,10 +198,14 @@ let with_span t ?parent name f =
         raise exn)
 
 let log sp level ?(fields = []) message =
+  if !(sp.sp_closed) then
+    invalid_arg
+      "Obs.log: span is already closed — a span value must not be used, or \
+       escape to another fiber/domain, after its with_span callback returns";
   sp.sp_log_buf := { level; message; fields } :: !(sp.sp_log_buf)
 
-let log_t t level ?(fields = []) message =
-  with_span t "log" (fun sp -> log sp level ~fields message)
+let log_t t ?parent level ?(fields = []) message =
+  with_span t ?parent "log" (fun sp -> log sp level ~fields message)
 
 let current_trace_ctx sp = sp.sp_ctx
 
@@ -284,9 +299,16 @@ let validate_metric_labels ~name ~label_names labels =
 
 let emit_metric t event = safe_call ~what:"emit_metric" (fun () -> t.backend.emit_metric event)
 
+let declare t ~name ~help ~kind ~label_names =
+  safe_call ~what:"declare_metric" (fun () ->
+    t.backend.declare_metric
+      { decl_name = name; decl_help = help; decl_kind = kind;
+        decl_label_names = label_names; decl_service = t.service })
+
 let register_counter t ~name ~help ~label_names : counter_fn =
   let name = metric_name name in
   let label_names = validate_label_names label_names in
+  declare t ~name ~help ~kind:`Counter ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     if value < 0 then
@@ -299,6 +321,7 @@ let register_counter t ~name ~help ~label_names : counter_fn =
 let register_gauge t ~name ~help ~label_names : gauge_fn =
   let name = metric_name name in
   let label_names = validate_label_names label_names in
+  declare t ~name ~help ~kind:`Gauge ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     emit_metric t {
@@ -313,6 +336,7 @@ let register_histogram t ~name ~help ~label_names : histogram_fn =
          "Obs.register_histogram %S: label name \"le\" is reserved for the \
           Prometheus bucket boundary" name);
   let label_names = validate_label_names label_names in
+  declare t ~name ~help ~kind:`Histogram ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     emit_metric t {
