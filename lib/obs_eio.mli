@@ -8,15 +8,15 @@
     boundary this library does not cross).
 
     {[
-      let ot = Obs.create ~service:"checkout-api"
-                 ~mono_clock:env#mono_clock ~backend:Obs.stdout in
-      let ot = Obs.with_context ot [("env", "prod")] in
+      let ot = Obs_eio.create ~service:"checkout-api"
+                 ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout in
+      let ot = Obs_eio.with_context ot [("env", "prod")] in
 
       (* Register once, at startup, from the handle whose context you want
          every emission from this counter to carry forever — see
          [metric_event.context]'s doc on why that context is frozen here,
          unlike a span's. *)
-      let requests_total = Obs.register_counter ot
+      let requests_total = Obs_eio.register_counter ot
         ~name:"http_requests_total"
         ~help:"Total HTTP requests handled"
         ~label_names:["route"; "status"] in
@@ -26,9 +26,9 @@
         (* Unlike the counter above, with_span picks up whatever context [ot]
            carries at the moment it's called — so a per-request derived [ot]
            here does reach this span's logs. *)
-        let ot = Obs.with_context ot [("request_id", req.id)] in
-        Obs.with_span ot ?parent "handle_request" (fun sp ->
-          Obs.log sp Obs.Info ~fields:[("route", req.route)] "handling request";
+        let ot = Obs_eio.with_context ot [("request_id", req.id)] in
+        Obs_eio.with_span ot ?parent "handle_request" (fun sp ->
+          Obs_eio.log sp Obs_eio.Info ~fields:[("route", req.route)] "handling request";
           requests_total ~labels:[("route", req.route); ("status", "200")] 1)
       in
       ignore handle_request
@@ -102,7 +102,17 @@ type backend = {
 (** A caller-supplied backend may raise; callers of [with_span], [log_t], and
     the [register_*] emitters/declarations never see that exception — it is
     caught and logged to stderr, so a broken backend cannot crash application
-    code. *)
+    code.
+
+    Every field is called synchronously, inline, on the calling fiber — there
+    is no queue, no background fiber, no offload of any kind at this layer.
+    A slow [emit_span]/[emit_metric]/[declare_metric] (e.g. one that blocks
+    on a network call) stalls whatever request path it's instrumenting for
+    exactly as long as it takes to return. A backend that talks to the
+    network (as [obs-loki-eio] and [obs-prometheus-eio]'s [push] do) owns
+    the decision of whether to do that work inline, with a bounded timeout,
+    or hand it off to a queue/background fiber itself — this layer does
+    neither for you. *)
 
 val noop    : backend
 (** Drops all events. Use in tests and CI. *)
@@ -165,18 +175,18 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
 
     There is no ambient/current-span mechanism: nesting is entirely manual.
     If code inside [f] calls another function that itself calls [with_span]
-    without explicitly passing [?parent:(Obs.current_trace_ctx sp)], that
+    without explicitly passing [?parent:(Obs_eio.current_trace_ctx sp)], that
     inner span starts a brand new root trace rather than becoming a child of
     the outer one — every intermediate call in between has to thread the
     parent context through by hand. This is a deliberate minimalism choice,
     not an oversight:
     {[
-      Obs.with_span ot "outer" (fun sp ->
-        let parent = Obs.current_trace_ctx sp in
+      Obs_eio.with_span ot "outer" (fun sp ->
+        let parent = Obs_eio.current_trace_ctx sp in
         do_inner_work ~parent ...)
       (* and inside do_inner_work: *)
       let do_inner_work ~parent ... =
-        Obs.with_span ot ~parent "inner" (fun _sp -> ...)
+        Obs_eio.with_span ot ~parent "inner" (fun _sp -> ...)
     ]} *)
 
 val log : span -> level -> ?fields:(string * string) list -> string -> unit
@@ -207,7 +217,9 @@ val current_trace_ctx : span -> Obs_trace.t
 val metric_name : string -> string
 (** [metric_name name] validates [name] against Prometheus metric naming
     rules and returns it unchanged. Raises [Invalid_argument] on invalid
-    names. *)
+    names. [:] is accepted (the grammar allows it) but is conventionally
+    reserved for recording rules (e.g. ["job:http_requests:rate5m"]), not
+    direct instrumentation — avoid it in a name you register here. *)
 
 type label_name = private string
 (** Validated Prometheus label name. Construct with [label_name]. The
@@ -218,7 +230,9 @@ type label_name = private string
 
 val label_name : string -> label_name
 (** [label_name name] validates [name] against Prometheus label naming rules
-    and returns it unchanged. Raises [Invalid_argument] on invalid names. *)
+    and returns it unchanged. Raises [Invalid_argument] on invalid names,
+    including a name starting with ["__"] — that prefix is reserved for
+    Prometheus's own internal use (e.g. [__name__]). *)
 
 val label_name_to_string : label_name -> string
 (** [label_name_to_string name] returns the validated label name as a string. *)
@@ -237,12 +251,13 @@ val register_counter
 (** Register a counter metric family — synchronously delivers a
     [metric_decl] to the backend's [declare_metric] before returning, then
     returns an emitter function. Call it once at startup, then call the
-    returned function per event. [label_names] must be unique; emitted
-    labels must match the declared names exactly. The emitter raises
-    [Invalid_argument] on a negative delta — Prometheus counters are
-    monotonic.
+    returned function per event. [label_names] must be unique and each must
+    pass the same rules as {!val-label_name} (so, e.g., a ["__"]-prefixed name is
+    rejected here too); emitted labels must match the declared names
+    exactly. The emitter raises [Invalid_argument] on a negative delta —
+    Prometheus counters are monotonic.
     {[
-      let reqs = Obs.register_counter ot ~name:"http_requests_total"
+      let reqs = Obs_eio.register_counter ot ~name:"http_requests_total"
                    ~help:"Total HTTP requests" ~label_names:["method";"status"] in
       reqs ~labels:[("method","POST");("status","200")] 1
     ]} *)
@@ -269,7 +284,12 @@ val register_histogram
     values (e.g. request latency), sorted into backend-defined buckets on
     emission. Follow Prometheus convention and observe values in the metric's
     base unit (seconds for a duration, not milliseconds) unless a specific
-    backend documents otherwise; nothing at this layer enforces a unit.
+    backend documents otherwise; nothing at this layer enforces a unit. The
+    emitter raises [Invalid_argument] on a negative observation — matching
+    [register_counter]'s negative-delta rejection, since a real distribution
+    (e.g. a duration) has no negative values; a negative input here means the
+    caller has a bug (e.g. a clock going backwards), not a legitimate
+    observation. [nan]/infinite observations are NOT rejected at this layer.
 
     [label_names] must not include ["le"] — raises [Invalid_argument] if it
     does, since the Prometheus backend synthesizes an ["le"] label per

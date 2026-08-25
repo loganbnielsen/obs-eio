@@ -2,5 +2,5 @@
  (name obs_eio)
  (public_name obs-eio)
  (wrapped false)
- (modules obs_trace obs)
+ (modules obs_trace obs_eio)
  (libraries eio mtime))

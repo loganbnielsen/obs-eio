@@ -129,7 +129,7 @@ let stdout =
    to a sibling backend in [compose]. *)
 let safe_call ~what f =
   try f () with exn ->
-    Printf.eprintf "Obs: backend %s raised: %s\n%!" what (Printexc.to_string exn)
+    Printf.eprintf "Obs_eio: backend %s raised: %s\n%!" what (Printexc.to_string exn)
 
 let compose a b = {
   emit_span      = (fun e ->
@@ -200,7 +200,7 @@ let with_span t ?parent name f =
 let log sp level ?(fields = []) message =
   if !(sp.sp_closed) then
     invalid_arg
-      "Obs.log: span is already closed — a span value must not be used, or \
+      "Obs_eio.log: span is already closed — a span value must not be used, or \
        escape to another fiber/domain, after its with_span callback returns";
   sp.sp_log_buf := { level; message; fields } :: !(sp.sp_log_buf)
 
@@ -231,14 +231,14 @@ let is_label_char = function
 
 let validate_name ~kind ~is_initial ~is_char name =
   if name = "" then
-    invalid_arg ("Obs." ^ kind ^ ": name must not be empty");
+    invalid_arg ("Obs_eio." ^ kind ^ ": name must not be empty");
   if not (is_initial name.[0]) then
     invalid_arg
-      (Printf.sprintf "Obs.%s: invalid Prometheus name %S" kind name);
+      (Printf.sprintf "Obs_eio.%s: invalid Prometheus name %S" kind name);
   String.iter (fun c ->
     if not (is_char c) then
       invalid_arg
-        (Printf.sprintf "Obs.%s: invalid Prometheus name %S" kind name)
+        (Printf.sprintf "Obs_eio.%s: invalid Prometheus name %S" kind name)
   ) name;
   name
 
@@ -249,10 +249,18 @@ let metric_name name =
     name
 
 let label_name name =
-  validate_name ~kind:"label_name"
-    ~is_initial:is_label_initial_char
-    ~is_char:is_label_char
-    name
+  let name =
+    validate_name ~kind:"label_name"
+      ~is_initial:is_label_initial_char
+      ~is_char:is_label_char
+      name
+  in
+  if String.length name >= 2 && name.[0] = '_' && name.[1] = '_' then
+    invalid_arg
+      (Printf.sprintf
+         "Obs_eio.label_name: %S starts with \"__\", reserved for Prometheus's \
+          own internal use (e.g. __name__)" name);
+  name
 
 let label_name_to_string name = name
 
@@ -270,7 +278,7 @@ let validate_label_names label_names =
    | None -> ()
    | Some name ->
      invalid_arg
-       (Printf.sprintf "Obs.register_metric: duplicate label name %S" name));
+       (Printf.sprintf "Obs_eio.register_metric: duplicate label name %S" name));
   label_names
 
 let validate_metric_labels ~name ~label_names labels =
@@ -278,7 +286,7 @@ let validate_metric_labels ~name ~label_names labels =
   match duplicate_name emitted_label_names with
   | Some label ->
     invalid_arg
-      (Printf.sprintf "Obs.emit_metric %S: duplicate label %S" name label)
+      (Printf.sprintf "Obs_eio.emit_metric %S: duplicate label %S" name label)
   | None ->
     let missing =
       List.filter (fun label -> not (List.mem_assoc label labels)) label_names
@@ -292,10 +300,10 @@ let validate_metric_labels ~name ~label_names labels =
     | [], [] -> ()
     | label :: _, _ ->
       invalid_arg
-        (Printf.sprintf "Obs.emit_metric %S: missing label %S" name label)
+        (Printf.sprintf "Obs_eio.emit_metric %S: missing label %S" name label)
     | [], label :: _ ->
       invalid_arg
-        (Printf.sprintf "Obs.emit_metric %S: extra label %S" name label)
+        (Printf.sprintf "Obs_eio.emit_metric %S: extra label %S" name label)
 
 let emit_metric t event = safe_call ~what:"emit_metric" (fun () -> t.backend.emit_metric event)
 
@@ -313,7 +321,7 @@ let register_counter t ~name ~help ~label_names : counter_fn =
     validate_metric_labels ~name ~label_names labels;
     if value < 0 then
       invalid_arg
-        (Printf.sprintf "Obs.emit_metric %S: counter delta must be >= 0, got %d" name value);
+        (Printf.sprintf "Obs_eio.emit_metric %S: counter delta must be >= 0, got %d" name value);
     emit_metric t {
       name; help; kind = `Counter value; labels; context = t.context; service = t.service;
     }
@@ -333,12 +341,15 @@ let register_histogram t ~name ~help ~label_names : histogram_fn =
   if List.mem "le" label_names then
     invalid_arg
       (Printf.sprintf
-         "Obs.register_histogram %S: label name \"le\" is reserved for the \
+         "Obs_eio.register_histogram %S: label name \"le\" is reserved for the \
           Prometheus bucket boundary" name);
   let label_names = validate_label_names label_names in
   declare t ~name ~help ~kind:`Histogram ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
+    if value < 0.0 then
+      invalid_arg
+        (Printf.sprintf "Obs_eio.emit_metric %S: histogram observation must be >= 0, got %g" name value);
     emit_metric t {
       name; help; kind = `Histogram value; labels; context = t.context; service = t.service;
     }

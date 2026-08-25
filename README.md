@@ -57,7 +57,7 @@ the stdlib `Random` module's fixed default seed, and safe to call concurrently f
 multiple OCaml 5 domains. Not cryptographically strong; fine for correlation and
 collision-avoidance, not for anything security-sensitive.
 
-### `Obs` — metric emitter types
+### `Obs_eio` — metric emitter types
 
 ```ocaml
 type counter_fn   = ?labels:(string * string) list -> int   -> unit
@@ -65,7 +65,7 @@ type gauge_fn     = ?labels:(string * string) list -> float -> unit
 type histogram_fn = ?labels:(string * string) list -> float -> unit
 ```
 
-### `Obs`
+### `Obs_eio`
 
 ```ocaml
 type level = Debug | Info | Warn | Error
@@ -179,28 +179,28 @@ whatever `t` `with_span` is called with each time.
 
 **There is no ambient/current-span mechanism** — nesting is entirely manual. If code
 inside a `with_span` callback calls another function that itself calls `with_span`
-without explicitly passing `?parent:(Obs.current_trace_ctx sp)`, that inner span starts
+without explicitly passing `?parent:(Obs_eio.current_trace_ctx sp)`, that inner span starts
 a brand new root trace rather than becoming a child of the outer one. Thread the parent
 context through by hand:
 
 ```ocaml
-Obs.with_span ot "outer" (fun sp ->
-  let parent = Obs.current_trace_ctx sp in
+Obs_eio.with_span ot "outer" (fun sp ->
+  let parent = Obs_eio.current_trace_ctx sp in
   do_inner_work ~parent ...)
 (* and inside do_inner_work: *)
 let do_inner_work ~parent ... =
-  Obs.with_span ot ~parent "inner" (fun _sp -> ...)
+  Obs_eio.with_span ot ~parent "inner" (fun _sp -> ...)
 ```
 
 ## Example Usage
 
 ```ocaml
-let ot = Obs.create ~service:"checkout-api"
-           ~mono_clock:env#mono_clock ~backend:Obs.stdout in
-let ot = Obs.with_context ot [("env", "prod"); ("region", "us-east-1")] in
+let ot = Obs_eio.create ~service:"checkout-api"
+           ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout in
+let ot = Obs_eio.with_context ot [("env", "prod"); ("region", "us-east-1")] in
 
 (* Register metrics once at startup *)
-let requests_total = Obs.register_counter ot
+let requests_total = Obs_eio.register_counter ot
   ~name:"http_requests_total"
   ~help:"Total HTTP requests handled"
   ~label_names:["route"; "status"] in
@@ -211,13 +211,13 @@ let handle_request req =
   (* Unlike requests_total above, with_span picks up whatever context [ot]
      carries at the moment it's called — so deriving a per-request [ot]
      here (before with_span, not inside it) does reach this span's logs. *)
-  let ot = Obs.with_context ot [("request_id", req.id)] in
-  Obs.with_span ot ?parent "handle_request" (fun sp ->
-    Obs.log sp Obs.Info ~fields:[("route", req.route)] "handling request";
+  let ot = Obs_eio.with_context ot [("request_id", req.id)] in
+  Obs_eio.with_span ot ?parent "handle_request" (fun sp ->
+    Obs_eio.log sp Obs_eio.Info ~fields:[("route", req.route)] "handling request";
     (* ... business logic ... *)
     requests_total ~labels:[("route", req.route); ("status", "200")] 1;
     (* propagate trace to a downstream call *)
-    let headers = Obs_trace.inject_to_headers (Obs.current_trace_ctx sp) [] in
+    let headers = Obs_trace.inject_to_headers (Obs_eio.current_trace_ctx sp) [] in
     ignore (ot, headers))
 in
 ignore handle_request
@@ -227,7 +227,7 @@ ignore handle_request
 
 - **Immutable context**: `with_context` returns a new `t`. The original is unchanged, so it is safe to pass the same `ot` to multiple concurrent fibers and derive per-fiber scoped copies.
 - **Monotonic time**: `span_event.start_ns` and `end_ns` use `Mtime.to_uint64_ns` on `Eio.Time.Mono.now` — unaffected by NTP corrections.
-- **OTel-compatible tracing**: `Obs_trace.t` carries W3C `traceparent`-compatible fields. `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
+- **W3C traceparent-compatible tracing**: `Obs_trace.t` carries fields compatible with the W3C `traceparent` propagation format — not OpenTelemetry's full data model, OTLP, baggage, or tracestate (see Out of Scope). `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
 - **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures, after synchronously delivering a `metric_decl` to the backend's `declare_metric` — so a backend can make a metric visible (e.g. at its zero value) as soon as it's registered, not only after its first observation.
 - **Backend composition**: `compose a b` fans out to two backends — use for e.g. `compose prometheus_backend loki_backend`.
 - **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_t`, and the `register_*` emitters/declarations catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other.
