@@ -57,6 +57,9 @@ the stdlib `Random` module's fixed default seed, and safe to call concurrently f
 multiple OCaml 5 domains. Not cryptographically strong; fine for correlation and
 collision-avoidance, not for anything security-sensitive.
 
+`of_traceparent` is intentionally lenient: it parses the W3C `traceparent` wire shape
+but does not reject the all-zero trace/span IDs that the spec reserves as invalid.
+
 ### `Obs_eio` — metric emitter types
 
 ```ocaml
@@ -228,7 +231,7 @@ ignore handle_request
 
 - **Immutable context**: `with_context` returns a new `t`. The original is unchanged, so it is safe to pass the same `ot` to multiple concurrent fibers and derive per-fiber scoped copies.
 - **Monotonic time**: `span_event.start_ns` and `end_ns` use `Mtime.to_uint64_ns` on `Eio.Time.Mono.now` — unaffected by NTP corrections.
-- **W3C traceparent-compatible tracing**: `Obs_trace.t` carries fields compatible with the W3C `traceparent` propagation format — not OpenTelemetry's full data model, OTLP, baggage, or tracestate (see Out of Scope). `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
+- **W3C traceparent-compatible tracing**: `Obs_trace.t` carries fields compatible with the W3C `traceparent` propagation format — with lenient parsing of all-zero IDs — not OpenTelemetry's full data model, OTLP, baggage, or tracestate (see Out of Scope). `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
 - **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures, after synchronously delivering a `metric_decl` to the backend's `declare_metric` — so a backend can make a metric visible (e.g. at its zero value) as soon as it's registered, not only after its first observation.
 - **Backend composition**: `compose a b` fans out to two backends — use for e.g. `compose prometheus_backend loki_backend`.
 - **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_t`, and the `register_*` emitters/declarations catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other. The one exception is `Eio.Cancel.Cancelled`, which is never caught this way — it always propagates, since a backend may do real blocking Eio I/O (see the `backend` type's doc) and a cancellation firing mid-call has to unwind the caller's structured concurrency correctly rather than being logged and ignored. If an application exception from `with_span`'s body would otherwise be lost because closing the span races a `Cancelled` from the backend, that original exception is logged to stderr before `Cancelled` wins — unless the body's own exception was `Cancelled` too, the ordinary case of one cancellation reaching both the body and the backend's I/O, where nothing is lost and nothing is logged. See `with_span`'s doc.
