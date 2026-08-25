@@ -2,6 +2,38 @@
 
 let noop_declare = (fun (_ : Obs.metric_decl) -> ())
 
+let capture_stdout f =
+  let old_stdout = Unix.dup Unix.stdout in
+  let read_fd, write_fd = Unix.pipe () in
+  Unix.dup2 write_fd Unix.stdout;
+  Unix.close write_fd;
+  let restored = ref false in
+  let restore () =
+    if not !restored then begin
+      Unix.dup2 old_stdout Unix.stdout;
+      Unix.close old_stdout;
+      restored := true
+    end
+  in
+  match f () with
+  | result ->
+    flush Stdlib.stdout;
+    restore ();
+    let ic = Unix.in_channel_of_descr read_fd in
+    let buf = Buffer.create 128 in
+    (try
+       while true do
+         Buffer.add_string buf (input_line ic);
+         Buffer.add_char buf '\n'
+       done
+     with End_of_file -> ());
+    close_in ic;
+    (result, Buffer.contents buf)
+  | exception exn ->
+    restore ();
+    Unix.close read_fd;
+    raise exn
+
 (* ------------------------------------------------------------------ *)
 (* Obs_trace                                                           *)
 (* ------------------------------------------------------------------ *)
@@ -81,6 +113,20 @@ let test_inject_replaces_existing_case_insensitive () =
   match Obs_trace.extract_from_headers headers with
   | None      -> Alcotest.fail "extract returned None"
   | Some ctx3 -> Alcotest.(check bool) "latest wins" true (ctx2.span_id = ctx3.span_id)
+
+let test_generate_is_domain_safe () =
+  let n_domains = 4 and per_domain = 200 in
+  let domains = List.init n_domains (fun _ ->
+    Domain.spawn (fun () ->
+      List.init per_domain (fun _ -> (Obs_trace.generate ()).span_id)))
+  in
+  let all_ids = List.concat_map Domain.join domains in
+  Alcotest.(check int) "no crash or lost work under concurrent domains"
+    (n_domains * per_domain) (List.length all_ids);
+  let module I64Set = Set.Make (Int64) in
+  let unique = I64Set.cardinal (I64Set.of_list all_ids) in
+  Alcotest.(check bool) "ids stay unique across domains (no torn/corrupted state)"
+    true (unique >= (n_domains * per_domain) - 1)
 
 let test_generate_uses_full_64_bits () =
   (* Random.State.int64 rng_state Int64.max_int would make the top bit of
@@ -485,6 +531,23 @@ let test_register_declares_before_first_emit () =
   c ~labels:[("route", "/")] 1;
   Alcotest.(check int) "emitted once after use" 1 !emitted
 
+let contains_substring haystack needle =
+  let h = String.length haystack and n = String.length needle in
+  let rec go i = i + n <= h && (String.sub haystack i n = needle || go (i + 1)) in
+  n = 0 || go 0
+
+let test_stdout_backend_runs_and_prints () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend:Obs.stdout in
+  let ((), output) = capture_stdout (fun () ->
+    Obs.with_span ot "op" (fun sp ->
+      Obs.log sp Obs.Info ~fields:[("key", "val")] "hello");
+    let c = Obs.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
+    c 1)
+  in
+  Alcotest.(check bool) "printed a SPAN line" true (contains_substring output "SPAN");
+  Alcotest.(check bool) "printed a METRIC line" true (contains_substring output "METRIC")
+
 let test_noop_compiles_and_runs () =
   Eio_main.run @@ fun env ->
   let ot = Obs.create ~service:"svc" ~mono_clock:env#mono_clock ~backend:Obs.noop in
@@ -573,6 +636,7 @@ let () =
       test_case "inject replaces mixed-case header" `Quick
         test_inject_replaces_existing_case_insensitive;
       test_case "generated ids use the full 64 bits" `Quick test_generate_uses_full_64_bits;
+      test_case "generate is safe across domains" `Quick test_generate_is_domain_safe;
     ];
     "context", [
       test_case "with_context merges and overrides" `Quick test_with_context_merges;
@@ -604,6 +668,7 @@ let () =
       test_case "register_histogram rejects \"le\" label" `Quick test_register_histogram_rejects_le_label;
       test_case "register declares before first emit" `Quick test_register_declares_before_first_emit;
       test_case "noop backend runs silently"   `Quick test_noop_compiles_and_runs;
+      test_case "stdout backend runs and prints" `Quick test_stdout_backend_runs_and_prints;
     ];
     "compose", [
       test_case "compose fans out to both backends" `Quick test_compose_fans_out;

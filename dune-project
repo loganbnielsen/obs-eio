@@ -21,7 +21,7 @@ obs-loki-eio and obs-prometheus-eio adapt to real exporters.")
  (depends
   (ocaml (>= 5.4.0))
   (eio (>= 1.3))
-  (mtime (>= 2.0))
+  (mtime (>= 2.1.0))
   (eio_main (and (>= 1.3) :with-test))
   (alcotest :with-test)
   (odoc :with-doc)))

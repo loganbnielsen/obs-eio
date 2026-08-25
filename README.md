@@ -44,6 +44,7 @@ type t = {
 
 val generate         : unit -> t               (* new root context *)
 val child_span       : t -> t                  (* same trace_id, new span_id *)
+val traceparent_header   : string              (* "traceparent" *)
 val to_traceparent   : t -> string             (* W3C "00-{32hex}-{16hex}-{02hex}" *)
 val of_traceparent   : string -> t option
 val extract_from_headers : (string * string) list -> t option
@@ -85,6 +86,18 @@ type span_event = {
   log_entries : log_entry list;
   context     : (string * string) list;
 }
+
+type metric_event = {
+  name    : string;
+  help    : string;
+  kind    : [ `Counter of int | `Gauge of float | `Histogram of float ];
+  labels  : (string * string) list;  (* call-site labels *)
+  context : (string * string) list;
+  service : string;
+}
+(* [context] is frozen at [register_*] time — see the note after the value
+   signatures below. Unlike [span_event.context], it does NOT track later
+   [with_context] calls on a different derived handle. *)
 
 type metric_decl = {
   decl_name        : string;
@@ -130,16 +143,54 @@ val log   : span -> level -> ?fields:(string * string) list -> string -> unit
 val log_t : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
 val current_trace_ctx : span -> Obs_trace.t
 
+type label_name = private string   (* validated Prometheus label name *)
+val label_name          : string -> label_name
+val label_name_to_string : label_name -> string
+(* Exists for backend packages that need their own validated, typed label-name
+   selectors (e.g. obs-loki-eio's stream-label selection) — the register_*
+   functions below validate their own `label_names:string list` internally
+   and don't use this type directly. *)
+
 val register_counter   : t -> name:string -> help:string -> label_names:string list -> counter_fn
 val register_gauge     : t -> name:string -> help:string -> label_names:string list -> gauge_fn
 val register_histogram : t -> name:string -> help:string -> label_names:string list -> histogram_fn
+val register_counter_and_histogram
+  :  t
+  -> counter_name:string -> counter_help:string -> counter_labels:string list
+  -> histogram_name:string -> histogram_help:string -> histogram_labels:string list
+  -> counter_fn * histogram_fn
 ```
 
 `register_counter`'s emitter raises `Invalid_argument` on a negative delta — Prometheus
 counters are monotonic. `register_histogram` raises `Invalid_argument` if `label_names`
 includes `"le"`, since the Prometheus backend synthesizes an `"le"` label per bucket
 sample. Bucket boundaries are backend-defined (`obs-prometheus-eio`'s `default_bounds`);
-there is no per-metric override.
+there is no per-metric override. Follow Prometheus convention and observe histogram
+values in the metric's base unit (seconds for a duration, not milliseconds) unless a
+specific backend says otherwise.
+
+**`metric_event.context` is frozen at registration, not per-call.** A `register_*`
+emitter closure captures the `t` it was registered from once; a later
+`with_context ot extra` on a *derived* handle never reaches an emitter already
+registered against the original `ot` — there is no way to pass per-call context to an
+emitter, only per-call `labels`. Register from the most-specific `t` you want reflected
+forever in a given metric family. This is unlike `span_event.context`, which reflects
+whatever `t` `with_span` is called with each time.
+
+**There is no ambient/current-span mechanism** — nesting is entirely manual. If code
+inside a `with_span` callback calls another function that itself calls `with_span`
+without explicitly passing `?parent:(Obs.current_trace_ctx sp)`, that inner span starts
+a brand new root trace rather than becoming a child of the outer one. Thread the parent
+context through by hand:
+
+```ocaml
+Obs.with_span ot "outer" (fun sp ->
+  let parent = Obs.current_trace_ctx sp in
+  do_inner_work ~parent ...)
+(* and inside do_inner_work: *)
+let do_inner_work ~parent ... =
+  Obs.with_span ot ~parent "inner" (fun _sp -> ...)
+```
 
 ## Example Usage
 
@@ -157,8 +208,11 @@ let requests_total = Obs.register_counter ot
 (* Per-request handler *)
 let handle_request req =
   let parent = Obs_trace.extract_from_headers req.headers in
+  (* Unlike requests_total above, with_span picks up whatever context [ot]
+     carries at the moment it's called — so deriving a per-request [ot]
+     here (before with_span, not inside it) does reach this span's logs. *)
+  let ot = Obs.with_context ot [("request_id", req.id)] in
   Obs.with_span ot ?parent "handle_request" (fun sp ->
-    let ot = Obs.with_context ot [("request_id", req.id)] in
     Obs.log sp Obs.Info ~fields:[("route", req.route)] "handling request";
     (* ... business logic ... *)
     requests_total ~labels:[("route", req.route); ("status", "200")] 1;

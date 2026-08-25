@@ -12,6 +12,10 @@
                  ~mono_clock:env#mono_clock ~backend:Obs.stdout in
       let ot = Obs.with_context ot [("env", "prod")] in
 
+      (* Register once, at startup, from the handle whose context you want
+         every emission from this counter to carry forever — see
+         [metric_event.context]'s doc on why that context is frozen here,
+         unlike a span's. *)
       let requests_total = Obs.register_counter ot
         ~name:"http_requests_total"
         ~help:"Total HTTP requests handled"
@@ -19,6 +23,10 @@
 
       let handle_request req =
         let parent = Obs_trace.extract_from_headers req.headers in
+        (* Unlike the counter above, with_span picks up whatever context [ot]
+           carries at the moment it's called — so a per-request derived [ot]
+           here does reach this span's logs. *)
+        let ot = Obs.with_context ot [("request_id", req.id)] in
         Obs.with_span ot ?parent "handle_request" (fun sp ->
           Obs.log sp Obs.Info ~fields:[("route", req.route)] "handling request";
           requests_total ~labels:[("route", req.route); ("status", "200")] 1)
@@ -58,7 +66,16 @@ type metric_event = {
   help    : string;
   kind    : [ `Counter of int | `Gauge of float | `Histogram of float ];
   labels  : (string * string) list;  (** call-site labels *)
-  context : (string * string) list;  (** ambient context from [with_context] *)
+  context : (string * string) list;
+  (** Ambient context from [with_context] — frozen at [register_*] time, unlike
+      [span_event.context]. The [t] a [register_*] emitter closure was built
+      from is fixed forever; a later [with_context ot extra] on a *different*
+      derived handle never reaches an emitter already registered against
+      [ot]. Register from the most-specific [t] you'll ever want reflected in
+      a given metric family, or re-register (a new family, since [name] is
+      the same) from the more-specific handle if you need per-call context on
+      a metric — there is no way to pass per-call context to an emitter, only
+      per-call [labels]. *)
   service : string;
 }
 
@@ -144,7 +161,23 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
     If [f] raises, the span closes with [Error] status and the exception propagates.
     [parent] is typically from [Obs_trace.extract_from_headers] on an incoming
     request — linking this span to the upstream trace. See [span]'s doc for
-    the lifetime [span] values are valid for. *)
+    the lifetime [span] values are valid for.
+
+    There is no ambient/current-span mechanism: nesting is entirely manual.
+    If code inside [f] calls another function that itself calls [with_span]
+    without explicitly passing [?parent:(Obs.current_trace_ctx sp)], that
+    inner span starts a brand new root trace rather than becoming a child of
+    the outer one — every intermediate call in between has to thread the
+    parent context through by hand. This is a deliberate minimalism choice,
+    not an oversight:
+    {[
+      Obs.with_span ot "outer" (fun sp ->
+        let parent = Obs.current_trace_ctx sp in
+        do_inner_work ~parent ...)
+      (* and inside do_inner_work: *)
+      let do_inner_work ~parent ... =
+        Obs.with_span ot ~parent "inner" (fun _sp -> ...)
+    ]} *)
 
 val log : span -> level -> ?fields:(string * string) list -> string -> unit
 (** [log span level ?fields message] records a structured log entry inside an
@@ -177,7 +210,11 @@ val metric_name : string -> string
     names. *)
 
 type label_name = private string
-(** Validated Prometheus label name. Construct with [label_name]. *)
+(** Validated Prometheus label name. Construct with [label_name]. The
+    [register_*] functions below validate their own [label_names:string list]
+    internally and don't use this type directly — it exists for backend
+    packages that need their own validated, typed label-name selectors (e.g.
+    [obs-loki-eio]'s stream-label selection). *)
 
 val label_name : string -> label_name
 (** [label_name name] validates [name] against Prometheus label naming rules
@@ -216,6 +253,11 @@ val register_gauge
   -> help:string
   -> label_names:string list
   -> gauge_fn
+(** Register a gauge metric family — a value that can go up or down (e.g. a
+    queue depth or an in-flight request count), unlike a counter. Same
+    registration/declaration behavior as [register_counter], minus the
+    negative-value rejection: a gauge's emitter simply replaces the current
+    value, so negative deltas make no sense here to reject. *)
 
 val register_histogram
   :  t
@@ -223,7 +265,13 @@ val register_histogram
   -> help:string
   -> label_names:string list
   -> histogram_fn
-(** [label_names] must not include ["le"] — raises [Invalid_argument] if it
+(** Register a histogram metric family — for distributions of observed
+    values (e.g. request latency), sorted into backend-defined buckets on
+    emission. Follow Prometheus convention and observe values in the metric's
+    base unit (seconds for a duration, not milliseconds) unless a specific
+    backend documents otherwise; nothing at this layer enforces a unit.
+
+    [label_names] must not include ["le"] — raises [Invalid_argument] if it
     does, since the Prometheus backend synthesizes an ["le"] label per
     bucket sample and a caller-declared one would collide with it.
     Bucket boundaries are backend-defined (e.g. [Obs_prometheus]'s
