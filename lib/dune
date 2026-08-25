@@ -1,0 +1,6 @@
+(library
+ (name obs_eio)
+ (public_name obs-eio)
+ (wrapped false)
+ (modules obs_trace obs)
+ (libraries eio mtime))
