@@ -126,9 +126,15 @@ let stdout =
 
 (* A backend is caller-supplied and may be buggy; isolate its failures so
    one broken backend can neither crash application code nor block delivery
-   to a sibling backend in [compose]. *)
+   to a sibling backend in [compose]. Eio.Cancel.Cancelled must NOT be
+   swallowed here: a backend doing inline network I/O (as obs-loki-eio and
+   obs-prometheus-eio's push do) is exactly where cancellation fires
+   mid-call, and demoting it to an stderr line instead of letting it
+   propagate would break the caller's structured-concurrency unwind. *)
 let safe_call ~what f =
-  try f () with exn ->
+  try f () with
+  | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | exn ->
     Printf.eprintf "Obs_eio: backend %s raised: %s\n%!" what (Printexc.to_string exn)
 
 let compose a b = {
@@ -176,26 +182,31 @@ let with_span t ?parent name f =
   in
   let sp_start = now_ns t in
   let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false } in
-  let outcome = ref `Ok in
-  Fun.protect
-    ~finally:(fun () ->
-      let end_ns = now_ns t in
-      let log_entries = List.rev !(sp.sp_log_buf) in
-      sp.sp_closed := true;
-      safe_call ~what:"emit_span" (fun () ->
-        t.backend.emit_span {
-          trace_ctx = sp_ctx; name; service = t.service;
-          start_ns = sp_start; end_ns;
-          status = !outcome;
-          log_entries;
-          context = t.context;
-        }))
-    (fun () ->
-      match f sp with
-      | v -> v
-      | exception exn ->
-        outcome := `Error (Printexc.to_string exn);
-        raise exn)
+  (* Deliberately not Fun.protect: its ~finally always wraps whatever it
+     raises in Fun.Finally_raised, including Eio.Cancel.Cancelled — which
+     would defeat safe_call's re-raise of Cancelled by handing the caller
+     an unrecognizable Finally_raised instead of a bare Cancelled. This
+     explicit match still emits the span on every exit path (return or
+     exception), the same guarantee Fun.protect's finally gave us, without
+     that wrapping. *)
+  let emit status =
+    let end_ns = now_ns t in
+    let log_entries = List.rev !(sp.sp_log_buf) in
+    sp.sp_closed := true;
+    safe_call ~what:"emit_span" (fun () ->
+      t.backend.emit_span {
+        trace_ctx = sp_ctx; name; service = t.service;
+        start_ns = sp_start; end_ns;
+        status;
+        log_entries;
+        context = t.context;
+      })
+  in
+  match f sp with
+  | v -> emit `Ok; v
+  | exception exn ->
+    emit (`Error (Printexc.to_string exn));
+    raise exn
 
 let log sp level ?(fields = []) message =
   if !(sp.sp_closed) then

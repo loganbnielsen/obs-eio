@@ -102,7 +102,11 @@ type backend = {
 (** A caller-supplied backend may raise; callers of [with_span], [log_t], and
     the [register_*] emitters/declarations never see that exception — it is
     caught and logged to stderr, so a broken backend cannot crash application
-    code.
+    code. The one exception that is never caught this way is
+    [Eio.Cancel.Cancelled]: since a backend may block on real Eio I/O (see
+    below), a cancellation firing inside one propagates normally instead of
+    being swallowed, so the fiber that owns this span/metric call still
+    unwinds correctly.
 
     Every field is called synchronously, inline, on the calling fiber — there
     is no queue, no background fiber, no offload of any kind at this layer.
@@ -124,13 +128,21 @@ val compose : backend -> backend -> backend
 (** Fan-out to two backends, e.g. [compose prometheus_backend loki_backend].
     Each backend's [emit_span]/[emit_metric]/[declare_metric] is called
     independently: if one raises, the exception is logged to stderr and the
-    other backend still receives the event. *)
+    other backend still receives the event — except [Eio.Cancel.Cancelled],
+    which is never caught here (see [backend]'s doc) and propagates as
+    normal, skipping the other backend, exactly as an uncaught exception
+    from any other Eio operation would. *)
 
 (* ------------------------------------------------------------------ *)
 (* Handle                                                              *)
 (* ------------------------------------------------------------------ *)
 
 type t
+(** Safe to share across fibers in one domain — its mutable state is only
+    the backend closures you gave it, plus, transitively, whatever
+    [Obs_trace]'s ID generator uses (mutex-protected; see [Obs_trace]'s note
+    on that). Not tied to any particular span or request. *)
+
 type span
 (** A [span] value is only valid for the extent of the [with_span] callback
     it was handed to — [log] raises [Invalid_argument] once that callback has
@@ -139,10 +151,7 @@ type span
     [Eio.Domain_manager.run]); a call to [log] from such a fiber will
     correctly raise rather than silently discard the entry, but the safe
     pattern is to open a new [with_span] inside that fiber/domain instead of
-    reusing the outer one. [t] itself is safe to share across fibers in one
-    domain (its mutable state is only the backend closures you gave it,
-    plus, transitively, whatever [Obs_trace]'s ID generator uses — see
-    [Obs_trace]'s note on that). *)
+    reusing the outer one. *)
 
 val create
   :  service:string
@@ -308,4 +317,12 @@ val register_counter_and_histogram
   -> counter_fn * histogram_fn
 (** Register a counter and histogram metric family together — for when a
     caller always wants both a count and a duration metric for the same
-    operation (e.g. "requests handled" plus "request duration"). *)
+    operation (e.g. "requests handled" plus "request duration").
+
+    If the counter half succeeds (and so has already reached the backend's
+    [declare_metric]) but the histogram half then raises — an invalid name
+    or label — the counter's declaration is not retracted. In practice this
+    only matters if a caller passes a bad histogram name/labels while a good
+    counter name/labels, which is a startup-time programmer error that will
+    raise immediately and be visible; it isn't a state a running service
+    would drift into later. *)

@@ -33,7 +33,12 @@ val of_traceparent : string -> t option
 (** Parse a W3C traceparent header value. Returns [None] if malformed.
     Does not reject the all-zero trace-id or span-id that the W3C spec
     reserves as invalid — a malformed-but-parseable upstream header is
-    accepted rather than treated as absent. *)
+    accepted rather than treated as absent. Follows the spec's forward-
+    compatibility rule: version ["00"] must be exactly the 4 documented
+    fields, but any other version (except the reserved-invalid ["ff"]) may
+    carry additional trailing fields for that future version's own use —
+    those are ignored, since trace-id/span-id/flags still live at the same
+    fixed positions regardless of version. *)
 
 val extract_from_headers : (string * string) list -> t option
 (** Look up {!traceparent_header} in a header list case-insensitively and parse it. *)

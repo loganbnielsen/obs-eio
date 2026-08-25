@@ -55,9 +55,22 @@ let test_child_span () =
 
 let test_of_traceparent_malformed () =
   Alcotest.(check bool) "garbage" true (Obs_trace.of_traceparent "garbage" = None);
-  Alcotest.(check bool) "wrong version" true
+  Alcotest.(check bool) "reserved invalid version \"ff\"" true
     (Obs_trace.of_traceparent
-       "01-00000000000000000000000000000001-0000000000000001-01" = None)
+       "ff-00000000000000000000000000000001-0000000000000001-01" = None);
+  Alcotest.(check bool) "version \"00\" with an extra trailing field" true
+    (Obs_trace.of_traceparent
+       "00-00000000000000000000000000000001-0000000000000001-01-extra" = None)
+
+let test_of_traceparent_forward_compatible_version () =
+  (* A future version ("01" here) may append trailing fields of its own;
+     trace-id/span-id/flags still parse from the same fixed positions. *)
+  match Obs_trace.of_traceparent
+          "01-00000000000000000000000000000001-0000000000000001-01-00f067aa0ba902b7" with
+  | None -> Alcotest.fail "expected Some: a non-00, non-ff version with trailing fields is valid"
+  | Some ctx ->
+    Alcotest.(check bool) "trace_id parsed" true (ctx.trace_id = (0L, 1L));
+    Alcotest.(check bool) "span_id parsed"  true (ctx.span_id = 1L)
 
 let test_of_traceparent_accepts_all_zero_reserved_id () =
   (* Documented leniency: the W3C-reserved all-zero trace-id/span-id parses
@@ -576,6 +589,7 @@ let test_register_declares_before_first_emit () =
    | [d] ->
      Alcotest.(check string) "declared name" "reqs_total" d.Obs_eio.decl_name;
      Alcotest.(check string) "declared help" "Total requests" d.Obs_eio.decl_help;
+     Alcotest.(check string) "declared service" "svc" d.Obs_eio.decl_service;
      Alcotest.(check bool)   "declared kind is Counter"
        true (d.Obs_eio.decl_kind = `Counter);
      Alcotest.(check (list string)) "declared label names" ["route"] d.Obs_eio.decl_label_names
@@ -671,6 +685,32 @@ let test_register_survives_raising_declare () =
   let c = Obs_eio.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   c 1
 
+let test_with_span_propagates_cancelled () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  (* Unlike an ordinary exception, Eio.Cancel.Cancelled from a backend must
+     NOT be swallowed — a cancellation is not "the backend is buggy", it's
+     the caller's own structured concurrency unwinding. *)
+  match Obs_eio.with_span ot "op" (fun _sp -> ()) with
+  | ()                              -> Alcotest.fail "Cancelled should have propagated, not been swallowed"
+  | exception Eio.Cancel.Cancelled _ -> ()
+
+let test_compose_propagates_cancelled_and_skips_sibling () =
+  Eio_main.run @@ fun env ->
+  let spans_b = ref 0 in
+  let backend_a = { Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
+                     emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  let backend_b = { Obs_eio.emit_span = (fun _ -> incr spans_b);
+                     emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:(Obs_eio.compose backend_a backend_b) in
+  (match Obs_eio.with_span ot "op" (fun _sp -> ()) with
+   | ()                              -> Alcotest.fail "Cancelled should have propagated"
+   | exception Eio.Cancel.Cancelled _ -> ());
+  Alcotest.(check int) "sibling backend was skipped, not called" 0 !spans_b
+
 (* ------------------------------------------------------------------ *)
 (* Test runner                                                         *)
 (* ------------------------------------------------------------------ *)
@@ -682,6 +722,7 @@ let () =
       test_case "traceparent round-trips"         `Quick test_traceparent_roundtrip;
       test_case "child_span inherits trace_id"    `Quick test_child_span;
       test_case "malformed traceparent → None"    `Quick test_of_traceparent_malformed;
+      test_case "forward-compatible version with trailing fields" `Quick test_of_traceparent_forward_compatible_version;
       test_case "all-zero reserved id parses leniently" `Quick test_of_traceparent_accepts_all_zero_reserved_id;
       test_case "inject/extract headers"          `Quick test_inject_extract_headers;
       test_case "inject replaces existing header" `Quick test_inject_replaces_existing;
@@ -734,5 +775,7 @@ let () =
       test_case "with_span survives a raising backend"        `Quick test_with_span_survives_raising_backend;
       test_case "register_counter survives a raising backend" `Quick test_register_counter_survives_raising_backend;
       test_case "register survives a raising declare_metric"  `Quick test_register_survives_raising_declare;
+      test_case "with_span propagates Cancelled instead of swallowing it" `Quick test_with_span_propagates_cancelled;
+      test_case "compose propagates Cancelled and skips the sibling"      `Quick test_compose_propagates_cancelled_and_skips_sibling;
     ];
   ]

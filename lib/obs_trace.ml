@@ -45,12 +45,20 @@ let to_traceparent t =
 
 let of_traceparent s =
   match String.split_on_char '-' s with
-  | [version; trace_hex; span_hex; flags_hex]
-    when version = "00"
+  (* W3C forward compatibility: version "00" must be exactly these 4 fields
+     (extra fields are malformed for the current version); any other
+     version (except the reserved-invalid "ff") may have additional
+     trailing fields for a future version's own use, which are ignored —
+     trace-id/parent-id/flags still live at these fixed positions. *)
+  | version :: trace_hex :: span_hex :: flags_hex :: rest
+    when version <> "ff"
+      && String.length version = 2
       && String.length trace_hex = 32
       && String.length span_hex  = 16
-      && String.length flags_hex = 2 ->
+      && String.length flags_hex = 2
+      && (version <> "00" || rest = []) ->
     (try
+       let _  = int_of_string ("0x" ^ version) in
        let hi = Int64.of_string ("0x" ^ String.sub trace_hex  0 16) in
        let lo = Int64.of_string ("0x" ^ String.sub trace_hex 16 16) in
        let si = Int64.of_string ("0x" ^ span_hex) in
