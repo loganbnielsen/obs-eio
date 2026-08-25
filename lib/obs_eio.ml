@@ -9,6 +9,7 @@ type histogram_fn = ?labels:(string * string) list -> float -> unit
 type level = Debug | Info | Warn | Error
 
 type log_entry = {
+  timestamp_ns : int64;
   level   : level;
   message : string;
   fields  : (string * string) list;
@@ -68,6 +69,10 @@ type span = {
   (* Set once [with_span]'s callback returns; [log] rejects a closed span
      rather than silently buffering into an entry nothing will ever read. *)
   sp_closed  : bool ref;
+  (* Same monotonic clock as start_ns/end_ns, captured from [t] at
+     [with_span] time so [log] can stamp each entry individually instead of
+     every entry in a span sharing one timestamp. *)
+  sp_now     : unit -> int64;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -181,7 +186,7 @@ let with_span t ?parent name f =
     | Some p -> Obs_trace.child_span p
   in
   let sp_start = now_ns t in
-  let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false } in
+  let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false; sp_now = (fun () -> now_ns t) } in
   (* Deliberately not Fun.protect: its ~finally always wraps whatever it
      raises in Fun.Finally_raised, including Eio.Cancel.Cancelled — which
      would defeat safe_call's re-raise of Cancelled by handing the caller
@@ -211,14 +216,22 @@ let with_span t ?parent name f =
        failure this span was closing on — would otherwise vanish with no
        trace anywhere, unlike safe_call's normal path which always logs a
        swallowed exception. Log it explicitly before letting Cancelled win,
-       so it's never silently lost. *)
+       so it's never silently lost — UNLESS [exn] is itself [Cancelled]:
+       that's the routine case of a cancellation propagating through both
+       the span body and the backend's own I/O from the same cancellation
+       context, not an application bug about to be masked, and logging it
+       would spam stderr on every ordinary timeout that reaches a
+       network-backed backend. *)
     (match emit (`Error msg) with
      | ()               -> raise exn
      | exception emit_exn ->
-       Printf.eprintf
-         "Obs_eio: with_span %S: application exception %s was about to \
-          close the span, but emit_span itself raised %s first\n%!"
-         name msg (Printexc.to_string emit_exn);
+       (match exn with
+        | Eio.Cancel.Cancelled _ -> ()
+        | _ ->
+          Printf.eprintf
+            "Obs_eio: with_span %S: application exception %s was about to \
+             close the span, but emit_span itself raised %s first\n%!"
+            name msg (Printexc.to_string emit_exn));
        raise emit_exn)
 
 let log sp level ?(fields = []) message =
@@ -226,7 +239,8 @@ let log sp level ?(fields = []) message =
     invalid_arg
       "Obs_eio.log: span is already closed — a span value must not be used, or \
        escape to another fiber/domain, after its with_span callback returns";
-  sp.sp_log_buf := { level; message; fields } :: !(sp.sp_log_buf)
+  let timestamp_ns = sp.sp_now () in
+  sp.sp_log_buf := { timestamp_ns; level; message; fields } :: !(sp.sp_log_buf)
 
 let log_t t ?parent level ?(fields = []) message =
   with_span t ?parent "log" (fun sp -> log sp level ~fields message)

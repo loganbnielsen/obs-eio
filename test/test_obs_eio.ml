@@ -759,6 +759,25 @@ let test_with_span_logs_original_exception_lost_to_cancelled () =
   Alcotest.(check bool) "the original failure was logged, not silently dropped"
     true (contains_substring stderr_output "original failure")
 
+let test_with_span_stays_silent_when_both_faults_are_cancelled () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
+  (* Routine case, not a double fault: the span body itself raises Cancelled
+     (e.g. the fiber was cancelled mid-body), and closing the span then also
+     raises Cancelled from the same cancellation. Nothing was actually lost
+     here — both exceptions are the same Cancelled — so this must NOT log
+     anything; logging it would spam stderr on every ordinary cancellation
+     that happens to reach a network-backed backend. *)
+  let ((), stderr_output) =
+    capture_stderr (fun () ->
+      match Obs_eio.with_span ot "op" (fun _sp -> raise (Eio.Cancel.Cancelled Exit)) with
+      | ()                                -> Alcotest.fail "expected Cancelled to propagate"
+      | exception Eio.Cancel.Cancelled _ -> ())
+  in
+  Alcotest.(check string) "nothing logged for a routine double cancellation" "" stderr_output
+
 let test_compose_propagates_cancelled_and_skips_sibling () =
   Eio_main.run @@ fun env ->
   let spans_b = ref 0 in
@@ -839,6 +858,7 @@ let () =
       test_case "register survives a raising declare_metric"  `Quick test_register_survives_raising_declare;
       test_case "with_span propagates Cancelled instead of swallowing it" `Quick test_with_span_propagates_cancelled;
       test_case "with_span logs an application exception lost to a racing Cancelled" `Quick test_with_span_logs_original_exception_lost_to_cancelled;
+      test_case "with_span stays silent on a routine double cancellation" `Quick test_with_span_stays_silent_when_both_faults_are_cancelled;
       test_case "compose propagates Cancelled and skips the sibling"      `Quick test_compose_propagates_cancelled_and_skips_sibling;
     ];
   ]

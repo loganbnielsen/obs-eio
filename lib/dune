@@ -1,3 +1,17 @@
+; wrapped false, exposing two flat top-level modules (Obs_eio, Obs_trace),
+; is a deliberate choice, re-examined and reaffirmed after audit feedback —
+; not an unexamined default. The collision risk that got the main module
+; renamed from the bare, generic `Obs` to `Obs_eio` doesn't carry over to
+; `Obs_trace` with the same force: a short generic word like `Obs` is likely
+; to already exist, independently, in many observability-adjacent
+; codebases, but a two-word compound like `Obs_trace` is not. The directly
+; relevant local precedent is kafka-eio-core (../kafka-eio/kafka-eio-core/
+; lib/dune in this same author's already-published sibling package): one
+; wrapped-false library exposing four flat modules (Kafka_raw, Kafka_error,
+; Kafka_consumer_handle, Kafka_security) together, not nested — the same
+; shape as here, already through this same audit process. Full wrapping
+; (nesting Obs_trace under Obs_eio) remains available later without being
+; a breaking change for most callers if this judgment call is revisited.
 (library
  (name obs_eio)
  (public_name obs-eio)

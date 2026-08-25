@@ -41,6 +41,13 @@
 type level = Debug | Info | Warn | Error
 
 type log_entry = {
+  timestamp_ns : int64;
+  (** Monotonic nanoseconds from the same clock as [span_event.start_ns]/
+      [end_ns] — the moment [log] was called, not when the span closed. A
+      backend that needs a wall-clock timestamp per entry can derive one
+      from [span_event.end_ns] and this field (e.g. by offsetting backward
+      from a wall-clock read taken at close time), since this layer never
+      touches the wall clock itself. *)
   level   : level;
   message : string;
   fields  : (string * string) list;
@@ -190,10 +197,14 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
     If the backend's own [emit_span] call raises [Eio.Cancel.Cancelled] while
     closing the span (see [backend]'s doc), that takes priority over the
     normal outcome: a successful [f]'s return value is discarded (cancellation
-    dominates, same as any other Eio operation racing a cancellation), and if
-    [f] itself raised first, that original exception is logged to stderr
-    before [Cancelled] propagates in its place — so it is never silently
-    lost, even though it isn't what the caller ultimately sees.
+    dominates, same as any other Eio operation racing a cancellation). If [f]
+    itself raised a different exception first, that original exception is
+    logged to stderr before [Cancelled] propagates in its place — so it is
+    never silently lost, even though it isn't what the caller ultimately
+    sees. If [f] itself raised [Cancelled] too (the ordinary case of one
+    cancellation reaching both the span body and the backend's own I/O),
+    nothing is logged — there is nothing to lose, both exceptions are the
+    same cancellation.
 
     There is no ambient/current-span mechanism: nesting is entirely manual.
     If code inside [f] calls another function that itself calls [with_span]
@@ -294,7 +305,8 @@ val register_gauge
     queue depth or an in-flight request count), unlike a counter. Same
     registration/declaration behavior as [register_counter], minus the
     negative-value rejection: a gauge's emitter simply replaces the current
-    value, so negative deltas make no sense here to reject. *)
+    value, so negative deltas make no sense here to reject. No value is
+    rejected here — negative, [nan], and infinite are all accepted as-is. *)
 
 val register_histogram
   :  t
@@ -311,7 +323,10 @@ val register_histogram
     [register_counter]'s negative-delta rejection, since a real distribution
     (e.g. a duration) has no negative values; a negative input here means the
     caller has a bug (e.g. a clock going backwards), not a legitimate
-    observation. [nan]/infinite observations are NOT rejected at this layer.
+    observation. [nan] and [infinity] are NOT rejected at this layer — only
+    [neg_infinity] is, as a side effect of the negative check above ([<] on
+    floats: [neg_infinity < 0.0] is [true], but [nan < 0.0] and
+    [infinity < 0.0] are both [false]), not a deliberate special case for it.
 
     [label_names] must not include ["le"] — raises [Invalid_argument] if it
     does, since the Prometheus backend synthesizes an ["le"] label per
