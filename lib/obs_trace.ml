@@ -4,14 +4,11 @@ type t = {
   trace_flags : char;
 }
 
-(* Self-seeded so trace/span IDs don't collide across process restarts —
-   unlike the global Random module, this needs no Random.self_init () call
-   from the caller (easy to forget, and silently falls back to a fixed seed).
-   [bits64] (not [int64 rng_state Int64.max_int]) so every bit is uniformly
-   random — [int64 _ Int64.max_int] can never set the top bit, silently
-   halving the ID space. Mutex-protected: Random.State.t mutation is not
-   domain-safe, and this state is process-wide, reachable from any domain
-   that calls [generate]/[child_span]. *)
+(* Self-seeded, unlike the global Random module, so callers never need
+   Random.self_init (). [bits64] not [int64 _ Int64.max_int] — the latter
+   can never set the top bit, silently halving the ID space. Mutex-protected
+   since Random.State.t mutation is not domain-safe and this state is
+   process-wide. *)
 let rng_state = Random.State.make_self_init ()
 let rng_mutex = Mutex.create ()
 
@@ -47,11 +44,9 @@ let is_hex_digit = function
   | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
   | _ -> false
 
-(* OCaml's Int64.of_string/int_of_string treat '_' as a digit-group
-   separator and happily parse e.g. "123456789abcde_f" as if the '_' were
-   not there — silently dropping a character instead of rejecting malformed
-   input. traceparent values come from arbitrary untrusted callers, so every
-   character must be checked to actually be hex before parsing. *)
+(* Int64.of_string/int_of_string treat '_' as a digit-group separator and
+   silently drop it rather than rejecting malformed input, so untrusted
+   traceparent values must be hex-checked before parsing. *)
 let is_hex_string s = String.for_all is_hex_digit s
 
 let of_traceparent s =
