@@ -259,7 +259,7 @@ let is_label_initial_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '_' -> true
   | _ -> false
 
-let is_name_char = function
+let is_metric_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | ':' -> true
   | _ -> false
 
@@ -283,7 +283,7 @@ let validate_name ~kind ~is_initial ~is_char name =
 let metric_name name =
   validate_name ~kind:"metric_name"
     ~is_initial:is_metric_initial_char
-    ~is_char:is_name_char
+    ~is_char:is_metric_char
     name
 
 let label_name name =
