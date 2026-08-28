@@ -259,7 +259,7 @@ let is_label_initial_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '_' -> true
   | _ -> false
 
-let is_name_char = function
+let is_metric_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | ':' -> true
   | _ -> false
 
@@ -283,7 +283,7 @@ let validate_name ~kind ~is_initial ~is_char name =
 let metric_name name =
   validate_name ~kind:"metric_name"
     ~is_initial:is_metric_initial_char
-    ~is_char:is_name_char
+    ~is_char:is_metric_char
     name
 
 let label_name name =
@@ -345,7 +345,7 @@ let validate_metric_labels ~name ~label_names labels =
 
 let emit_metric t event = safe_call ~what:"emit_metric" (fun () -> t.backend.emit_metric event)
 
-let declare t ~name ~help ~kind ~label_names =
+let declare_metric t ~name ~help ~kind ~label_names =
   safe_call ~what:"declare_metric" (fun () ->
     t.backend.declare_metric
       { decl_name = name; decl_help = help; decl_kind = kind;
@@ -354,7 +354,7 @@ let declare t ~name ~help ~kind ~label_names =
 let register_counter t ~name ~help ~label_names : counter_fn =
   let name = metric_name name in
   let label_names = validate_label_names label_names in
-  declare t ~name ~help ~kind:`Counter ~label_names;
+  declare_metric t ~name ~help ~kind:`Counter ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     if value < 0 then
@@ -367,7 +367,7 @@ let register_counter t ~name ~help ~label_names : counter_fn =
 let register_gauge t ~name ~help ~label_names : gauge_fn =
   let name = metric_name name in
   let label_names = validate_label_names label_names in
-  declare t ~name ~help ~kind:`Gauge ~label_names;
+  declare_metric t ~name ~help ~kind:`Gauge ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     emit_metric t {
@@ -382,7 +382,7 @@ let register_histogram t ~name ~help ~label_names : histogram_fn =
          "Obs_eio.register_histogram %S: label name \"le\" is reserved for the \
           Prometheus bucket boundary" name);
   let label_names = validate_label_names label_names in
-  declare t ~name ~help ~kind:`Histogram ~label_names;
+  declare_metric t ~name ~help ~kind:`Histogram ~label_names;
   fun ?(labels = []) value ->
     validate_metric_labels ~name ~label_names labels;
     if value < 0.0 then
