@@ -35,18 +35,18 @@ type metric_event = {
   service : string;
 }
 
-type metric_decl = {
-  decl_name        : string;
-  decl_help        : string;
-  decl_kind        : [ `Counter | `Gauge | `Histogram ];
-  decl_label_names : string list;
-  decl_service     : string;
+type metric_declaration = {
+  declaration_name        : string;
+  declaration_help        : string;
+  declaration_kind        : [ `Counter | `Gauge | `Histogram ];
+  declaration_label_names : string list;
+  declaration_service     : string;
 }
 
 type backend = {
   emit_span      : span_event   -> unit;
   emit_metric    : metric_event -> unit;
-  declare_metric : metric_decl  -> unit;
+  declare_metric : metric_declaration  -> unit;
 }
 
 type label_name = string
@@ -227,10 +227,10 @@ let log sp level ?(fields = []) message =
   let timestamp_ns = sp.sp_now () in
   sp.sp_log_buf := { timestamp_ns; level; message; fields } :: !(sp.sp_log_buf)
 
-let log_t t ?parent level ?(fields = []) message =
+let log_standalone t ?parent level ?(fields = []) message =
   with_span t ?parent "log" (fun sp -> log sp level ~fields message)
 
-let current_trace_ctx sp = sp.sp_ctx
+let current_trace_context sp = sp.sp_ctx
 
 (* ------------------------------------------------------------------ *)
 (* Metrics                                                             *)
@@ -333,8 +333,8 @@ let emit_metric t event = safe_call ~what:"emit_metric" (fun () -> t.backend.emi
 let declare_metric t ~name ~help ~kind ~label_names =
   safe_call ~what:"declare_metric" (fun () ->
     t.backend.declare_metric
-      { decl_name = name; decl_help = help; decl_kind = kind;
-        decl_label_names = label_names; decl_service = t.service })
+      { declaration_name = name; declaration_help = help; declaration_kind = kind;
+        declaration_label_names = label_names; declaration_service = t.service })
 
 let register_counter t ~name ~help ~label_names : counter_fn =
   let name = metric_name name in

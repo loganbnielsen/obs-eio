@@ -1,6 +1,6 @@
 (** Unit tests for obs-eio. No broker required. *)
 
-let noop_declare = (fun (_ : Obs_eio.metric_decl) -> ())
+let noop_declare = (fun (_ : Obs_eio.metric_declaration) -> ())
 
 let capture_stdout f =
   let old_stdout = Unix.dup Unix.stdout in
@@ -348,7 +348,7 @@ let test_current_trace_ctx_child_of_parent () =
   let ot     = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock ~backend:Obs_eio.noop in
   let parent = Obs_trace.generate () in
   Obs_eio.with_span ot ~parent "child" (fun sp ->
-    let ctx = Obs_eio.current_trace_ctx sp in
+    let ctx = Obs_eio.current_trace_context sp in
     Alcotest.(check bool) "inherits trace_id"
       true (parent.Obs_trace.trace_id = ctx.Obs_trace.trace_id);
     Alcotest.(check bool) "new span_id"
@@ -372,8 +372,8 @@ let test_log_t_uses_parent () =
     ~backend:{ Obs_eio.emit_span = (fun e -> spans := e :: !spans);
                emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
   let parent = Obs_trace.generate () in
-  Obs_eio.log_t ot ~parent Obs_eio.Info "standalone log";
-  Alcotest.(check bool) "log_t's span shares the parent trace_id"
+  Obs_eio.log_standalone ot ~parent Obs_eio.Info "standalone log";
+  Alcotest.(check bool) "log_standalone's span shares the parent trace_id"
     true (parent.Obs_trace.trace_id = (List.hd !spans).Obs_eio.trace_ctx.Obs_trace.trace_id)
 
 (* ------------------------------------------------------------------ *)
@@ -625,12 +625,12 @@ let test_register_declares_before_first_emit () =
   Alcotest.(check int) "not emitted yet" 0 !emitted;
   (match !declared with
    | [d] ->
-     Alcotest.(check string) "declared name" "reqs_total" d.Obs_eio.decl_name;
-     Alcotest.(check string) "declared help" "Total requests" d.Obs_eio.decl_help;
-     Alcotest.(check string) "declared service" "svc" d.Obs_eio.decl_service;
+     Alcotest.(check string) "declared name" "reqs_total" d.Obs_eio.declaration_name;
+     Alcotest.(check string) "declared help" "Total requests" d.Obs_eio.declaration_help;
+     Alcotest.(check string) "declared service" "svc" d.Obs_eio.declaration_service;
      Alcotest.(check bool)   "declared kind is Counter"
-       true (d.Obs_eio.decl_kind = `Counter);
-     Alcotest.(check (list string)) "declared label names" ["route"] d.Obs_eio.decl_label_names
+       true (d.Obs_eio.declaration_kind = `Counter);
+     Alcotest.(check (list string)) "declared label names" ["route"] d.Obs_eio.declaration_label_names
    | _ -> Alcotest.fail "expected exactly one declaration");
   c ~labels:[("route", "/")] 1;
   Alcotest.(check int) "emitted once after use" 1 !emitted
@@ -817,9 +817,9 @@ let () =
       test_case "log appends entries to span"     `Quick test_log_appends_to_span;
       test_case "log order preserved"             `Quick test_log_order_preserved;
       test_case "log after close raises"          `Quick test_log_after_close_raises;
-      test_case "current_trace_ctx child of parent" `Quick test_current_trace_ctx_child_of_parent;
+      test_case "current_trace_context child of parent" `Quick test_current_trace_ctx_child_of_parent;
       test_case "root span has valid traceparent" `Quick test_with_span_no_parent_generates_root;
-      test_case "log_t uses ?parent"               `Quick test_log_t_uses_parent;
+      test_case "log_standalone uses ?parent"               `Quick test_log_t_uses_parent;
     ];
     "metrics", [
       test_case "counter emits metric event"   `Quick test_counter_emits_event;
