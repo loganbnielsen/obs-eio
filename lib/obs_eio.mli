@@ -90,12 +90,12 @@ type metric_event = {
   service : string;
 }
 
-type metric_decl = {
-  decl_name        : string;
-  decl_help        : string;
-  decl_kind        : [ `Counter | `Gauge | `Histogram ];
-  decl_label_names : string list;
-  decl_service     : string;
+type metric_declaration = {
+  declaration_name        : string;
+  declaration_help        : string;
+  declaration_kind        : [ `Counter | `Gauge | `Histogram ];
+  declaration_label_names : string list;
+  declaration_service     : string;
 }
 (** Registration-time metadata for one metric family, delivered to
     [backend.declare_metric] once per [register_*] call — before the first
@@ -108,9 +108,9 @@ type metric_decl = {
 type backend = {
   emit_span      : span_event   -> unit;
   emit_metric    : metric_event -> unit;
-  declare_metric : metric_decl  -> unit;
+  declare_metric : metric_declaration  -> unit;
 }
-(** A caller-supplied backend may raise; callers of [with_span], [log_t], and
+(** A caller-supplied backend may raise; callers of [with_span], [log_standalone], and
     the [register_*] emitters/declarations never see that exception — it is
     caught and logged to stderr, so a broken backend cannot crash application
     code. The one exception that is never caught this way is
@@ -208,14 +208,14 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
 
     There is no ambient/current-span mechanism: nesting is entirely manual.
     If code inside [f] calls another function that itself calls [with_span]
-    without explicitly passing [?parent:(Obs_eio.current_trace_ctx sp)], that
+    without explicitly passing [?parent:(Obs_eio.current_trace_context sp)], that
     inner span starts a brand new root trace rather than becoming a child of
     the outer one — every intermediate call in between has to thread the
     parent context through by hand. This is a deliberate minimalism choice,
     not an oversight:
     {[
       Obs_eio.with_span ot "outer" (fun sp ->
-        let parent = Obs_eio.current_trace_ctx sp in
+        let parent = Obs_eio.current_trace_context sp in
         do_inner_work ~parent ...)
       (* and inside do_inner_work: *)
       let do_inner_work ~parent ... =
@@ -229,8 +229,8 @@ val log : span -> level -> ?fields:(string * string) list -> string -> unit
     automatically. Raises [Invalid_argument] if [span]'s [with_span] callback
     has already returned — see [span]'s doc. *)
 
-val log_t : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
-(** [log_t ot ?parent level ?fields message] logs without an explicit calling
+val log_standalone : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
+(** [log_standalone ot ?parent level ?fields message] logs without an explicit calling
     convention for an existing span. Equivalent to
     [with_span ot ?parent "log" (fun sp -> log sp level ?fields message)] —
     still opens (and immediately closes) a span internally, since this
@@ -238,8 +238,8 @@ val log_t : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list 
     correlate the resulting span with an ambient trace instead of starting a
     new root trace for every log call. *)
 
-val current_trace_ctx : span -> Obs_trace.t
-(** [current_trace_ctx span] returns the active [Obs_trace.t] for an open span.
+val current_trace_context : span -> Obs_trace.t
+(** [current_trace_context span] returns the active [Obs_trace.t] for an open span.
     Use with [Obs_trace.inject_to_headers] to propagate the trace into an
     outgoing request, linking the downstream span to this trace. *)
 
@@ -282,7 +282,7 @@ val register_counter
   -> label_names:string list
   -> counter_fn
 (** Register a counter metric family — synchronously delivers a
-    [metric_decl] to the backend's [declare_metric] before returning, then
+    [metric_declaration] to the backend's [declare_metric] before returning, then
     returns an emitter function. Call it once at startup, then call the
     returned function per event. [label_names] must be unique and each must
     pass the same rules as {!val-label_name} (so, e.g., a ["__"]-prefixed name is
