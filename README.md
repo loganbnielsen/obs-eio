@@ -103,12 +103,12 @@ type metric_event = {
    signatures below. Unlike [span_event.context], it does NOT track later
    [with_context] calls on a different derived handle. *)
 
-type metric_decl = {
-  decl_name        : string;
-  decl_help        : string;
-  decl_kind        : [ `Counter | `Gauge | `Histogram ];
-  decl_label_names : string list;
-  decl_service     : string;
+type metric_declaration = {
+  declaration_name        : string;
+  declaration_help        : string;
+  declaration_kind        : [ `Counter | `Gauge | `Histogram ];
+  declaration_label_names : string list;
+  declaration_service     : string;
 }
 (* Registration-time metadata, delivered to [backend.declare_metric] once per
    [register_*] call, before the first [emit_metric] for that family — possibly
@@ -119,9 +119,9 @@ type metric_decl = {
 type backend = {
   emit_span      : span_event   -> unit;
   emit_metric    : metric_event -> unit;
-  declare_metric : metric_decl  -> unit;
+  declare_metric : metric_declaration  -> unit;
 }
-(* A caller-supplied backend may raise; callers of [with_span], [log_t], and the
+(* A caller-supplied backend may raise; callers of [with_span], [log_standalone], and the
    [register_*] emitters/declarations never see that exception — it is caught and
    logged to stderr, so a broken backend cannot crash application code. *)
 
@@ -144,8 +144,8 @@ val with_span : t -> ?parent:Obs_trace.t -> string -> (span -> 'a) -> 'a
 val log   : span -> level -> ?fields:(string * string) list -> string -> unit
 (* Raises [Invalid_argument] once [span]'s [with_span] callback has returned —
    see Design Notes below on [span]'s lifetime. *)
-val log_t : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
-val current_trace_ctx : span -> Obs_trace.t
+val log_standalone : t -> ?parent:Obs_trace.t -> level -> ?fields:(string * string) list -> string -> unit
+val current_trace_context : span -> Obs_trace.t
 
 type label_name = private string   (* validated Prometheus label name *)
 val label_name          : string -> label_name
@@ -183,13 +183,13 @@ whatever `t` `with_span` is called with each time.
 
 **There is no ambient/current-span mechanism** — nesting is entirely manual. If code
 inside a `with_span` callback calls another function that itself calls `with_span`
-without explicitly passing `?parent:(Obs_eio.current_trace_ctx sp)`, that inner span starts
+without explicitly passing `?parent:(Obs_eio.current_trace_context sp)`, that inner span starts
 a brand new root trace rather than becoming a child of the outer one. Thread the parent
 context through by hand:
 
 ```ocaml
 Obs_eio.with_span ot "outer" (fun sp ->
-  let parent = Obs_eio.current_trace_ctx sp in
+  let parent = Obs_eio.current_trace_context sp in
   do_inner_work ~parent ...)
 (* and inside do_inner_work: *)
 let do_inner_work ~parent ... =
@@ -221,7 +221,7 @@ let handle_request req =
     (* ... business logic ... *)
     requests_total ~labels:[("route", req.route); ("status", "200")] 1;
     (* propagate trace to a downstream call *)
-    let headers = Obs_trace.inject_to_headers (Obs_eio.current_trace_ctx sp) [] in
+    let headers = Obs_trace.inject_to_headers (Obs_eio.current_trace_context sp) [] in
     ignore (ot, headers))
 in
 ignore handle_request
@@ -232,9 +232,9 @@ ignore handle_request
 - **Immutable context**: `with_context` returns a new `t`. The original is unchanged, so it is safe to pass the same `ot` to multiple concurrent fibers and derive per-fiber scoped copies.
 - **Monotonic time**: `span_event.start_ns` and `end_ns` use `Mtime.to_uint64_ns` on `Eio.Time.Mono.now` — unaffected by NTP corrections.
 - **W3C traceparent-compatible tracing**: `Obs_trace.t` carries fields compatible with the W3C `traceparent` propagation format — with lenient parsing of all-zero IDs — not OpenTelemetry's full data model, OTLP, baggage, or tracestate (see Out of Scope). `extract_from_headers` / `inject_to_headers` connect producers, brokers, and consumers into a single distributed trace.
-- **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures, after synchronously delivering a `metric_decl` to the backend's `declare_metric` — so a backend can make a metric visible (e.g. at its zero value) as soon as it's registered, not only after its first observation.
+- **Pre-registered metrics**: `register_counter` / `register_gauge` / `register_histogram` return typed emitter closures, after synchronously delivering a `metric_declaration` to the backend's `declare_metric` — so a backend can make a metric visible (e.g. at its zero value) as soon as it's registered, not only after its first observation.
 - **Backend composition**: `compose a b` fans out to two backends — use for e.g. `compose prometheus_backend loki_backend`.
-- **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_t`, and the `register_*` emitters/declarations catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other. The one exception is `Eio.Cancel.Cancelled`, which is never caught this way — it always propagates, since a backend may do real blocking Eio I/O (see the `backend` type's doc) and a cancellation firing mid-call has to unwind the caller's structured concurrency correctly rather than being logged and ignored. If an application exception from `with_span`'s body would otherwise be lost because closing the span races a `Cancelled` from the backend, that original exception is logged to stderr before `Cancelled` wins — unless the body's own exception was `Cancelled` too, the ordinary case of one cancellation reaching both the body and the backend's I/O, where nothing is lost and nothing is logged. See `with_span`'s doc.
+- **Backend failure isolation**: a caller-supplied backend may raise; `with_span`, `log_standalone`, and the `register_*` emitters/declarations catch it and log to stderr rather than propagate it, so a broken backend cannot crash application code. `compose` isolates each sibling the same way, so one broken backend cannot also block delivery to the other. The one exception is `Eio.Cancel.Cancelled`, which is never caught this way — it always propagates, since a backend may do real blocking Eio I/O (see the `backend` type's doc) and a cancellation firing mid-call has to unwind the caller's structured concurrency correctly rather than being logged and ignored. If an application exception from `with_span`'s body would otherwise be lost because closing the span races a `Cancelled` from the backend, that original exception is logged to stderr before `Cancelled` wins — unless the body's own exception was `Cancelled` too, the ordinary case of one cancellation reaching both the body and the backend's I/O, where nothing is lost and nothing is logged. See `with_span`'s doc.
 - **Span lifetime**: a `span` value is only valid for the extent of the `with_span` callback it was handed to — `log` raises `Invalid_argument` once that callback has returned, so stashing a `span` in a ref or a fiber/domain that outlives the callback fails loudly instead of silently discarding log entries. Open a new `with_span` inside that fiber/domain instead of reusing the outer one.
 - **Single-domain `t`**: `t` is safe to share across fibers within one domain. `Obs_trace`'s ID generator is safe across domains (mutex-protected); a `span`'s log buffer is not meant to be written from more than one domain.
 
