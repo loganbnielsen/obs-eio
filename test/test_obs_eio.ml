@@ -192,11 +192,9 @@ let test_generate_is_domain_safe () =
     true (unique >= (n_domains * per_domain) - 1)
 
 let test_generate_uses_full_64_bits () =
-  (* Random.State.int64 rng_state Int64.max_int would make the top bit of
-     every id always 0 (never in [0x8000000000000000, 0xffffffffffffffff]).
-     Generate enough ids that seeing at least one with the top bit set is
-     overwhelmingly likely if the fix is in place, and impossible if it
-     regresses back to the old biased generator. *)
+  (* Random.State.int64 rng_state Int64.max_int would leave the top bit of
+     every id always 0; with a uniform generator, seeing it set at least
+     once across enough ids is overwhelmingly likely. *)
   let top_bit_set id = Int64.compare id 0L < 0 in
   let ids = List.init 200 (fun _ -> (Obs_trace.generate ()).span_id) in
   Alcotest.(check bool) "at least one span_id has the top bit set"
@@ -216,7 +214,7 @@ let test_with_context_merges () =
   } in
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock ~backend in
   let ot = Obs_eio.with_context ot [("env", "prod"); ("region", "us-east-1")] in
-  let ot = Obs_eio.with_context ot [("env", "staging")] in  (* override env *)
+  let ot = Obs_eio.with_context ot [("env", "staging")] in
   let emit = Obs_eio.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   emit 1;
   Alcotest.(check string) "env overridden to staging"
@@ -742,11 +740,9 @@ let test_with_span_logs_original_exception_lost_to_cancelled () =
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
                emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
-  (* Double fault: the application body fails with an ordinary exception,
-     and closing the span (emit_span) then also raises Cancelled instead of
-     returning. Cancelled must win (it's what the caller sees), but the
-     original application failure must not vanish with no trace at all — it
-     has to be logged before Cancelled takes over. *)
+  (* Double fault: the body raises an ordinary exception, then emit_span
+     also raises Cancelled. Cancelled wins, but the original failure must
+     still be logged, not silently lost. *)
   let (result, stderr_output) =
     capture_stderr (fun () ->
       match Obs_eio.with_span ot "op" (fun _sp -> failwith "original failure") with
@@ -764,12 +760,8 @@ let test_with_span_stays_silent_when_both_faults_are_cancelled () =
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
     ~backend:{ Obs_eio.emit_span = (fun _ -> raise (Eio.Cancel.Cancelled Exit));
                emit_metric = (fun _ -> ()); declare_metric = noop_declare } in
-  (* Routine case, not a double fault: the span body itself raises Cancelled
-     (e.g. the fiber was cancelled mid-body), and closing the span then also
-     raises Cancelled from the same cancellation. Nothing was actually lost
-     here — both exceptions are the same Cancelled — so this must NOT log
-     anything; logging it would spam stderr on every ordinary cancellation
-     that happens to reach a network-backed backend. *)
+  (* Routine case, not a double fault: both the body and emit_span raise the
+     same Cancelled, so nothing was lost and nothing should be logged. *)
   let ((), stderr_output) =
     capture_stderr (fun () ->
       match Obs_eio.with_span ot "op" (fun _sp -> raise (Eio.Cancel.Cancelled Exit)) with

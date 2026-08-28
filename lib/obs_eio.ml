@@ -129,13 +129,9 @@ let stdout =
     declare_metric = (fun _ -> ());
   }
 
-(* A backend is caller-supplied and may be buggy; isolate its failures so
-   one broken backend can neither crash application code nor block delivery
-   to a sibling backend in [compose]. Eio.Cancel.Cancelled must NOT be
-   swallowed here: a backend doing inline network I/O (as obs-loki-eio and
-   obs-prometheus-eio's push do) is exactly where cancellation fires
-   mid-call, and demoting it to an stderr line instead of letting it
-   propagate would break the caller's structured-concurrency unwind. *)
+(* Isolates a buggy backend so it can't crash the caller or block a sibling
+   in [compose]. Eio.Cancel.Cancelled is never swallowed — it must propagate
+   for the caller's structured concurrency to unwind correctly. *)
 let safe_call ~what f =
   try f () with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
@@ -187,13 +183,9 @@ let with_span t ?parent name f =
   in
   let sp_start = now_ns t in
   let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false; sp_now = (fun () -> now_ns t) } in
-  (* Deliberately not Fun.protect: its ~finally always wraps whatever it
-     raises in Fun.Finally_raised, including Eio.Cancel.Cancelled — which
-     would defeat safe_call's re-raise of Cancelled by handing the caller
-     an unrecognizable Finally_raised instead of a bare Cancelled. This
-     explicit match still emits the span on every exit path (return or
-     exception), the same guarantee Fun.protect's finally gave us, without
-     that wrapping. *)
+  (* Not Fun.protect: its ~finally wraps any raised exception, including
+     Cancelled, in Fun.Finally_raised, which would defeat safe_call's
+     Cancelled re-raise. This match still emits on every exit path. *)
   let emit status =
     let end_ns = now_ns t in
     let log_entries = List.rev !(sp.sp_log_buf) in
@@ -211,17 +203,10 @@ let with_span t ?parent name f =
   | v -> emit `Ok; v
   | exception exn ->
     let msg = Printexc.to_string exn in
-    (* emit itself can raise (only Eio.Cancel.Cancelled can escape safe_call
-       — see safe_call). If it does here, [exn] — the actual application
-       failure this span was closing on — would otherwise vanish with no
-       trace anywhere, unlike safe_call's normal path which always logs a
-       swallowed exception. Log it explicitly before letting Cancelled win,
-       so it's never silently lost — UNLESS [exn] is itself [Cancelled]:
-       that's the routine case of a cancellation propagating through both
-       the span body and the backend's own I/O from the same cancellation
-       context, not an application bug about to be masked, and logging it
-       would spam stderr on every ordinary timeout that reaches a
-       network-backed backend. *)
+    (* emit can itself raise only Cancelled (see safe_call); if it does,
+       log the original [exn] before letting Cancelled win so it isn't
+       silently lost. Skip logging when [exn] is itself Cancelled — that's
+       an ordinary double-cancellation, not a masked application bug. *)
     (match emit (`Error msg) with
      | ()               -> raise exn
      | exception emit_exn ->
