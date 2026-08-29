@@ -112,15 +112,13 @@ let test_of_traceparent_forward_compatible_version () =
     Alcotest.(check bool) "trace_id parsed" true (ctx.trace_id = (0L, 1L));
     Alcotest.(check bool) "span_id parsed"  true (ctx.span_id = 1L)
 
-let test_of_traceparent_accepts_all_zero_reserved_id () =
-  (* Documented leniency: the W3C-reserved all-zero trace-id/span-id parses
-     successfully rather than being treated as malformed. *)
-  match Obs_trace.of_traceparent
-          "00-00000000000000000000000000000000-0000000000000000-01" with
-  | None -> Alcotest.fail "expected Some, all-zero ids are parsed leniently"
-  | Some ctx ->
-    Alcotest.(check bool) "trace_id is all zero" true (ctx.trace_id = (0L, 0L));
-    Alcotest.(check bool) "span_id is all zero"  true (ctx.span_id = 0L)
+let test_of_traceparent_rejects_all_zero_reserved_id () =
+  Alcotest.(check bool) "all-zero trace-id is rejected" true
+    (Obs_trace.of_traceparent
+       "00-00000000000000000000000000000000-0000000000000001-01" = None);
+  Alcotest.(check bool) "all-zero span-id is rejected" true
+    (Obs_trace.of_traceparent
+       "00-00000000000000000000000000000001-0000000000000000-01" = None)
 
 let test_inject_extract_headers () =
   let ctx     = Obs_trace.generate () in
@@ -796,7 +794,7 @@ let () =
       test_case "child_span inherits trace_id"    `Quick test_child_span;
       test_case "malformed traceparent → None"    `Quick test_of_traceparent_malformed;
       test_case "forward-compatible version with trailing fields" `Quick test_of_traceparent_forward_compatible_version;
-      test_case "all-zero reserved id parses leniently" `Quick test_of_traceparent_accepts_all_zero_reserved_id;
+      test_case "all-zero reserved ids are rejected" `Quick test_of_traceparent_rejects_all_zero_reserved_id;
       test_case "inject/extract headers"          `Quick test_inject_extract_headers;
       test_case "inject replaces existing header" `Quick test_inject_replaces_existing;
       test_case "extract mixed-case header"       `Quick test_extract_headers_case_insensitive;
