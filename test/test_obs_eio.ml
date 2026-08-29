@@ -198,6 +198,17 @@ let test_generate_uses_full_64_bits () =
   Alcotest.(check bool) "at least one span_id has the top bit set"
     true (List.exists top_bit_set ids)
 
+let test_generate_never_uses_reserved_zero_ids () =
+  let root = Obs_trace.generate () in
+  let child = Obs_trace.child_span root in
+  let trace_nonzero (hi, lo) = hi <> 0L || lo <> 0L in
+  Alcotest.(check bool) "root trace_id is nonzero" true
+    (trace_nonzero root.trace_id);
+  Alcotest.(check bool) "root span_id is nonzero" true
+    (root.span_id <> 0L);
+  Alcotest.(check bool) "child span_id is nonzero" true
+    (child.span_id <> 0L)
+
 (* ------------------------------------------------------------------ *)
 (* Context                                                             *)
 (* ------------------------------------------------------------------ *)
@@ -801,6 +812,8 @@ let () =
       test_case "inject replaces mixed-case header" `Quick
         test_inject_replaces_existing_case_insensitive;
       test_case "generated ids use the full 64 bits" `Quick test_generate_uses_full_64_bits;
+      test_case "generated ids avoid reserved zero values" `Quick
+        test_generate_never_uses_reserved_zero_ids;
       test_case "generate is safe across domains" `Quick test_generate_is_domain_safe;
     ];
     "context", [

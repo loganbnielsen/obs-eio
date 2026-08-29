@@ -17,13 +17,23 @@ let random_int64 () =
   Fun.protect ~finally:(fun () -> Mutex.unlock rng_mutex)
     (fun () -> Random.State.bits64 rng_state)
 
+let rec random_nonzero_int64 () =
+  match random_int64 () with
+  | 0L -> random_nonzero_int64 ()
+  | n -> n
+
+let rec random_trace_id () =
+  match (random_int64 (), random_int64 ()) with
+  | 0L, 0L -> random_trace_id ()
+  | trace_id -> trace_id
+
 let generate () = {
-  trace_id    = (random_int64 (), random_int64 ());
-  span_id     = random_int64 ();
+  trace_id    = random_trace_id ();
+  span_id     = random_nonzero_int64 ();
   trace_flags = '\x01';  (* sampled *)
 }
 
-let child_span t = { t with span_id = random_int64 () }
+let child_span t = { t with span_id = random_nonzero_int64 () }
 
 let traceparent_header = "traceparent"
 

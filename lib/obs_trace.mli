@@ -6,7 +6,7 @@
     those; this module isn't the place for them (see the README's Out of
     Scope section for the reasoning). *)
 
-type t = {
+type t = private {
   trace_id    : int64 * int64;  (** 128-bit trace identifier *)
   span_id     : int64;          (** 64-bit span identifier *)
   trace_flags : char;           (** bit 0 = sampled *)
