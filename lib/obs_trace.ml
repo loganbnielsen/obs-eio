@@ -66,12 +66,13 @@ let of_traceparent s =
       && String.lowercase_ascii version <> "ff"
       && (version <> "00" || rest = []) ->
     (try
-       let hi = Int64.of_string ("0x" ^ String.sub trace_hex  0 16) in
-       let lo = Int64.of_string ("0x" ^ String.sub trace_hex 16 16) in
-       let si = Int64.of_string ("0x" ^ span_hex) in
-       let fl = Char.chr (int_of_string ("0x" ^ flags_hex)) in
-       Some { trace_id = (hi, lo); span_id = si; trace_flags = fl }
-     with _ -> None)
+	       let hi = Int64.of_string ("0x" ^ String.sub trace_hex  0 16) in
+	       let lo = Int64.of_string ("0x" ^ String.sub trace_hex 16 16) in
+	       let si = Int64.of_string ("0x" ^ span_hex) in
+	       let fl = Char.chr (int_of_string ("0x" ^ flags_hex)) in
+	       if (hi = 0L && lo = 0L) || si = 0L then None
+	       else Some { trace_id = (hi, lo); span_id = si; trace_flags = fl }
+	     with _ -> None)
   | _ -> None
 
 let extract_from_headers headers =
