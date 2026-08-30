@@ -57,8 +57,8 @@ the stdlib `Random` module's fixed default seed, and safe to call concurrently f
 multiple OCaml 5 domains. Not cryptographically strong; fine for correlation and
 collision-avoidance, not for anything security-sensitive.
 
-`of_traceparent` is intentionally lenient: it parses the W3C `traceparent` wire shape
-but does not reject the all-zero trace/span IDs that the spec reserves as invalid.
+`of_traceparent` parses the W3C `traceparent` wire shape and rejects the all-zero
+trace ID or span ID that the spec reserves as invalid, returning `None` for either.
 
 ### `Obs_eio` — metric emitter types
 
