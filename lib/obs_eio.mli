@@ -147,11 +147,12 @@ val stdout  : backend
 val compose : backend -> backend -> backend
 (** Fan-out to two backends, e.g. [compose prometheus_backend loki_backend].
     Each backend's [emit_span]/[emit_metric]/[declare_metric] is called
-    independently: if one raises, the exception is logged to stderr and the
-    other backend still receives the event — except [Eio.Cancel.Cancelled],
-    which is never caught here (see [backend]'s doc) and propagates as
-    normal, skipping the other backend, exactly as an uncaught exception
-    from any other Eio operation would. *)
+    independently: if one raises, the other backend still receives the event
+    and the first exception is re-raised afterward for [create]'s
+    [on_backend_error] handler. [Eio.Cancel.Cancelled] is never caught here
+    (see [backend]'s doc) and propagates immediately, skipping the other
+    backend, exactly as an uncaught exception from any other Eio operation
+    would. *)
 
 (* ------------------------------------------------------------------ *)
 (* Handle                                                              *)

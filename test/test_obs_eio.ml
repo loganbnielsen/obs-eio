@@ -721,6 +721,7 @@ let test_compose_fans_out () =
 let test_compose_isolates_a_raising_sibling () =
   Eio_main.run @@ fun env ->
   let spans_b = ref 0 and metrics_b = ref 0 and declares_b = ref 0 in
+  let backend_errors = ref 0 in
   let backend_a =
     { Obs_eio.emit_span = (fun _ -> failwith "boom span");
       emit_metric = (fun _ -> failwith "boom metric");
@@ -730,13 +731,15 @@ let test_compose_isolates_a_raising_sibling () =
       emit_metric = (fun _ -> incr metrics_b);
       declare_metric = (fun _ -> incr declares_b) } in
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~on_backend_error:(fun _ _ -> incr backend_errors)
     ~backend:(Obs_eio.compose backend_a backend_b) () in
   Obs_eio.with_span ot "op" (fun _sp -> ());
   let c = Obs_eio.register_counter ot ~name:"n" ~help:"" ~label_names:[] in
   c 1;
   Alcotest.(check int) "sibling still received span despite a's exception" 1 !spans_b;
   Alcotest.(check int) "sibling still received metric despite a's exception" 1 !metrics_b;
-  Alcotest.(check int) "sibling still received declare despite a's exception" 1 !declares_b
+  Alcotest.(check int) "sibling still received declare despite a's exception" 1 !declares_b;
+  Alcotest.(check int) "composed backend failures reported to owner" 3 !backend_errors
 
 let test_with_span_survives_raising_backend () =
   Eio_main.run @@ fun env ->

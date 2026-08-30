@@ -172,22 +172,28 @@ let safe_call ~on_error f =
   | Eio.Cancel.Cancelled _ as exn -> raise exn
   | exn -> on_error exn
 
-let compose_safe_call ~what f =
-  safe_call
-    ~on_error:(fun exn ->
-      Printf.eprintf "Obs_eio: backend %s raised: %s\n%!" what (Printexc.to_string exn))
-    f
+let compose_call first_error f =
+  try f () with
+  | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | exn ->
+    if !first_error = None then first_error := Some exn
 
 let compose a b = {
   emit_span      = (fun e ->
-    compose_safe_call ~what:"emit_span"      (fun () -> a.emit_span e);
-    compose_safe_call ~what:"emit_span"      (fun () -> b.emit_span e));
+    let first_error = ref None in
+    compose_call first_error (fun () -> a.emit_span e);
+    compose_call first_error (fun () -> b.emit_span e);
+    match !first_error with Some exn -> raise exn | None -> ());
   emit_metric    = (fun e ->
-    compose_safe_call ~what:"emit_metric"    (fun () -> a.emit_metric e);
-    compose_safe_call ~what:"emit_metric"    (fun () -> b.emit_metric e));
+    let first_error = ref None in
+    compose_call first_error (fun () -> a.emit_metric e);
+    compose_call first_error (fun () -> b.emit_metric e);
+    match !first_error with Some exn -> raise exn | None -> ());
   declare_metric = (fun d ->
-    compose_safe_call ~what:"declare_metric" (fun () -> a.declare_metric d);
-    compose_safe_call ~what:"declare_metric" (fun () -> b.declare_metric d));
+    let first_error = ref None in
+    compose_call first_error (fun () -> a.declare_metric d);
+    compose_call first_error (fun () -> b.declare_metric d);
+    match !first_error with Some exn -> raise exn | None -> ());
 }
 
 (* ------------------------------------------------------------------ *)
