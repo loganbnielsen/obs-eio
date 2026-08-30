@@ -116,11 +116,10 @@ type backend = {
     and the [register_*] emitters/declarations never see ordinary backend
     exceptions — they are sent to [create]'s [on_backend_error] handler, so a
     broken backend cannot crash application code. If that handler itself
-    raises, the failure falls back to stderr. The one exception that is never caught this way is
-    [Eio.Cancel.Cancelled]: since a backend may block on real Eio I/O (see
-    below), a cancellation firing inside one propagates normally instead of
-    being swallowed, so the fiber that owns this span/metric call still
-    unwinds correctly.
+    raises, the failure falls back to stderr. [Eio.Cancel.Cancelled],
+    [Out_of_memory], [Stack_overflow], and [Sys.Break] are never caught this
+    way: cancellation must unwind Eio structured concurrency, and fatal runtime
+    failures must not be turned into telemetry backend errors.
 
     Every field is called synchronously, inline, on the calling fiber — there
     is no queue, no background fiber, no offload of any kind at this layer.
@@ -149,10 +148,10 @@ val compose : backend -> backend -> backend
     Each backend's [emit_span]/[emit_metric]/[declare_metric] is called
     independently: if one raises, the other backend still receives the event
     and the first exception is re-raised afterward for [create]'s
-    [on_backend_error] handler. [Eio.Cancel.Cancelled] is never caught here
-    (see [backend]'s doc) and propagates immediately, skipping the other
-    backend, exactly as an uncaught exception from any other Eio operation
-    would. *)
+    [on_backend_error] handler. Cancellation and fatal runtime exceptions are
+    never caught here (see [backend]'s doc) and propagate immediately, skipping
+    the other backend, exactly as an uncaught exception from any other Eio
+    operation would. *)
 
 (* ------------------------------------------------------------------ *)
 (* Handle                                                              *)
@@ -188,7 +187,8 @@ val create
 
     [on_backend_error], if supplied, is called synchronously when a backend
     raises during span/metric/declaration delivery. If it raises, the error is
-    reported to stderr instead; [Eio.Cancel.Cancelled] still propagates. *)
+    reported to stderr instead; cancellation and fatal runtime exceptions still
+    propagate. *)
 
 (* ------------------------------------------------------------------ *)
 (* Context                                                             *)

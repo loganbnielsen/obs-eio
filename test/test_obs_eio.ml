@@ -830,6 +830,19 @@ let test_backend_error_handler_propagates_cancelled () =
   | () -> Alcotest.fail "Cancelled should have propagated from on_backend_error"
   | exception Eio.Cancel.Cancelled _ -> ()
 
+let test_backend_error_handler_propagates_fatal () =
+  Eio_main.run @@ fun env ->
+  let ot =
+    Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+      ~on_backend_error:(fun _ _ -> raise Stack_overflow)
+      ~backend:{ Obs_eio.emit_span = (fun _ -> ()); emit_metric = (fun _ -> failwith "emit boom");
+                 declare_metric = noop_declare } ()
+  in
+  let c = Obs_eio.register_counter ot ~name:"reqs_total" ~help:"desc" ~label_names:[] in
+  match c 1 with
+  | () -> Alcotest.fail "Stack_overflow should have propagated from on_backend_error"
+  | exception Stack_overflow -> ()
+
 let test_with_span_propagates_cancelled () =
   Eio_main.run @@ fun env ->
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
@@ -841,6 +854,15 @@ let test_with_span_propagates_cancelled () =
   match Obs_eio.with_span ot "op" (fun _sp -> ()) with
   | ()                              -> Alcotest.fail "Cancelled should have propagated, not been swallowed"
   | exception Eio.Cancel.Cancelled _ -> ()
+
+let test_with_span_propagates_fatal () =
+  Eio_main.run @@ fun env ->
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun _ -> raise Stack_overflow);
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } () in
+  match Obs_eio.with_span ot "op" (fun _sp -> ()) with
+  | () -> Alcotest.fail "Stack_overflow should have propagated, not been swallowed"
+  | exception Stack_overflow -> ()
 
 let test_with_span_logs_original_exception_lost_to_cancelled () =
   Eio_main.run @@ fun env ->
@@ -961,7 +983,9 @@ let () =
       test_case "backend errors go to scoped handler"         `Quick test_backend_errors_go_to_scoped_handler;
       test_case "backend error handler failure falls back"    `Quick test_backend_error_handler_failure_falls_back_to_stderr;
       test_case "backend error handler propagates Cancelled"  `Quick test_backend_error_handler_propagates_cancelled;
+      test_case "backend error handler propagates fatal exceptions" `Quick test_backend_error_handler_propagates_fatal;
       test_case "with_span propagates Cancelled instead of swallowing it" `Quick test_with_span_propagates_cancelled;
+      test_case "with_span propagates fatal exceptions"       `Quick test_with_span_propagates_fatal;
       test_case "with_span logs an application exception lost to a racing Cancelled" `Quick test_with_span_logs_original_exception_lost_to_cancelled;
       test_case "with_span stays silent on a routine double cancellation" `Quick test_with_span_stays_silent_when_both_faults_are_cancelled;
       test_case "compose propagates Cancelled and skips the sibling"      `Quick test_compose_propagates_cancelled_and_skips_sibling;

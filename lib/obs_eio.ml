@@ -158,6 +158,7 @@ let default_backend_error op exn =
 let report_backend_error t op exn =
   try t.on_backend_error op exn with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | (Out_of_memory | Stack_overflow | Sys.Break) as exn -> raise exn
   | handler_exn ->
     Printf.eprintf
       "Obs_eio: backend_error_handler_raised op=%s handler_exn=%S original_exn=%S\n%!"
@@ -170,11 +171,13 @@ let report_backend_error t op exn =
 let safe_call ~on_error f =
   try f () with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | (Out_of_memory | Stack_overflow | Sys.Break) as exn -> raise exn
   | exn -> on_error exn
 
 let compose_call first_error f =
   try f () with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | (Out_of_memory | Stack_overflow | Sys.Break) as exn -> raise exn
   | exn ->
     if !first_error = None then first_error := Some exn
 
