@@ -9,7 +9,7 @@
 
     {[
       let ot = Obs_eio.create ~service:"checkout-api"
-                 ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout in
+                 ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout () in
       let ot = Obs_eio.with_context ot [("env", "prod")] in
 
       (* Register once, at startup, from the handle whose context you want
@@ -90,10 +90,12 @@ type metric_event = {
   service : string;
 }
 
+type metric_kind = [ `Counter | `Gauge | `Histogram ]
+
 type metric_declaration = {
   declaration_name        : string;
   declaration_help        : string;
-  declaration_kind        : [ `Counter | `Gauge | `Histogram ];
+  declaration_kind        : metric_kind;
   declaration_label_names : string list;
   declaration_service     : string;
 }
@@ -110,10 +112,11 @@ type backend = {
   emit_metric    : metric_event -> unit;
   declare_metric : metric_declaration  -> unit;
 }
-(** A caller-supplied backend may raise; callers of [with_span], [log_standalone], and
-    the [register_*] emitters/declarations never see that exception — it is
-    caught and logged to stderr, so a broken backend cannot crash application
-    code. The one exception that is never caught this way is
+(** A caller-supplied backend may raise; callers of [with_span], [log_standalone],
+    and the [register_*] emitters/declarations never see ordinary backend
+    exceptions — they are sent to [create]'s [on_backend_error] handler, so a
+    broken backend cannot crash application code. If that handler itself
+    raises, the failure falls back to stderr. The one exception that is never caught this way is
     [Eio.Cancel.Cancelled]: since a backend may block on real Eio I/O (see
     below), a cancellation firing inside one propagates normally instead of
     being swallowed, so the fiber that owns this span/metric call still
@@ -128,6 +131,12 @@ type backend = {
     the decision of whether to do that work inline, with a bounded timeout,
     or hand it off to a queue/background fiber itself — this layer does
     neither for you. *)
+
+type backend_op =
+  | Emit_span of { name : string }
+  | Emit_metric of { name : string; kind : metric_kind }
+  | Declare_metric of { name : string; kind : metric_kind }
+(** Backend operation that failed. Passed to [on_backend_error]. *)
 
 val noop    : backend
 (** Drops all events. Use in tests and CI. *)
@@ -150,10 +159,10 @@ val compose : backend -> backend -> backend
 
 type t
 (** Immutable and safe to share across fibers in one domain. Using it can
-    still reach mutable state, but none of it belongs to [t] itself: the
-    backend closures you gave it may close over whatever they like, and
-    [Obs_trace]'s ID generator is a mutex-protected process-global, not part
-    of any particular [t]. Not tied to any particular span or request. *)
+    still reach protected mutable state: backend closures may close over their
+    own state, metric declarations are tracked inside [t], and [Obs_trace]'s
+    ID generator is a mutex-protected process-global. Not tied to any
+    particular span or request. *)
 
 type span
 (** A [span] value is only valid for the extent of the [with_span] callback
@@ -168,11 +177,17 @@ type span
 val create
   :  service:string
   -> mono_clock:_ Eio.Time.Mono.t
+  -> ?on_backend_error:(backend_op -> exn -> unit)
   -> backend:backend
+  -> unit
   -> t
-(** [create ~service ~mono_clock ~backend] creates an observability handle.
+(** [create ~service ~mono_clock ~backend ()] creates an observability handle.
     [mono_clock] is used for span duration measurement only — pass [env#mono_clock].
-    Wall clock is never used for span timestamps. *)
+    Wall clock is never used for span timestamps.
+
+    [on_backend_error], if supplied, is called synchronously when a backend
+    raises during span/metric/declaration delivery. If it raises, the error is
+    reported to stderr instead; [Eio.Cancel.Cancelled] still propagates. *)
 
 (* ------------------------------------------------------------------ *)
 (* Context                                                             *)

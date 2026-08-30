@@ -35,10 +35,12 @@ type metric_event = {
   service : string;
 }
 
+type metric_kind = [ `Counter | `Gauge | `Histogram ]
+
 type metric_declaration = {
   declaration_name        : string;
   declaration_help        : string;
-  declaration_kind        : [ `Counter | `Gauge | `Histogram ];
+  declaration_kind        : metric_kind;
   declaration_label_names : string list;
   declaration_service     : string;
 }
@@ -49,6 +51,11 @@ type backend = {
   declare_metric : metric_declaration  -> unit;
 }
 
+type backend_op =
+  | Emit_span of { name : string }
+  | Emit_metric of { name : string; kind : metric_kind }
+  | Declare_metric of { name : string; kind : metric_kind }
+
 type label_name = string
 
 (* ------------------------------------------------------------------ *)
@@ -56,10 +63,13 @@ type label_name = string
 (* ------------------------------------------------------------------ *)
 
 type t = {
-  service  : string;
-  get_time : unit -> Mtime.t;  (* closure over mono_clock *)
-  backend  : backend;
-  context  : (string * string) list;
+  service             : string;
+  get_time            : unit -> Mtime.t;  (* closure over mono_clock *)
+  backend             : backend;
+  context             : (string * string) list;
+  on_backend_error    : backend_op -> exn -> unit;
+  metric_declarations : (string, metric_declaration) Hashtbl.t;
+  metric_mutex        : Mutex.t;
 }
 
 type span = {
@@ -129,36 +139,69 @@ let stdout =
     declare_metric = (fun _ -> ());
   }
 
-(* Isolates a buggy backend so it can't crash the caller or block a sibling
-   in [compose]. Eio.Cancel.Cancelled is never swallowed — it must propagate
-   for the caller's structured concurrency to unwind correctly. *)
-let safe_call ~what f =
+let string_of_metric_kind = function
+  | `Counter -> "counter"
+  | `Gauge -> "gauge"
+  | `Histogram -> "histogram"
+
+let string_of_backend_op = function
+  | Emit_span { name } -> Printf.sprintf "emit_span name=%S" name
+  | Emit_metric { name; kind } ->
+    Printf.sprintf "emit_metric name=%S kind=%s" name (string_of_metric_kind kind)
+  | Declare_metric { name; kind } ->
+    Printf.sprintf "declare_metric name=%S kind=%s" name (string_of_metric_kind kind)
+
+let default_backend_error op exn =
+  Printf.eprintf "Obs_eio: backend_error op=%s exn=%S\n%!"
+    (string_of_backend_op op) (Printexc.to_string exn)
+
+let report_backend_error t op exn =
+  try t.on_backend_error op exn with
+  | Eio.Cancel.Cancelled _ as exn -> raise exn
+  | handler_exn ->
+    Printf.eprintf
+      "Obs_eio: backend_error_handler_raised op=%s handler_exn=%S original_exn=%S\n%!"
+      (string_of_backend_op op)
+      (Printexc.to_string handler_exn)
+      (Printexc.to_string exn)
+
+(* Eio cancellation is control flow owned by the caller's switch, not a
+   backend failure. Keep it propagating through both catch layers. *)
+let safe_call ~on_error f =
   try f () with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
-  | exn ->
-    Printf.eprintf "Obs_eio: backend %s raised: %s\n%!" what (Printexc.to_string exn)
+  | exn -> on_error exn
+
+let compose_safe_call ~what f =
+  safe_call
+    ~on_error:(fun exn ->
+      Printf.eprintf "Obs_eio: backend %s raised: %s\n%!" what (Printexc.to_string exn))
+    f
 
 let compose a b = {
   emit_span      = (fun e ->
-    safe_call ~what:"emit_span"      (fun () -> a.emit_span e);
-    safe_call ~what:"emit_span"      (fun () -> b.emit_span e));
+    compose_safe_call ~what:"emit_span"      (fun () -> a.emit_span e);
+    compose_safe_call ~what:"emit_span"      (fun () -> b.emit_span e));
   emit_metric    = (fun e ->
-    safe_call ~what:"emit_metric"    (fun () -> a.emit_metric e);
-    safe_call ~what:"emit_metric"    (fun () -> b.emit_metric e));
+    compose_safe_call ~what:"emit_metric"    (fun () -> a.emit_metric e);
+    compose_safe_call ~what:"emit_metric"    (fun () -> b.emit_metric e));
   declare_metric = (fun d ->
-    safe_call ~what:"declare_metric" (fun () -> a.declare_metric d);
-    safe_call ~what:"declare_metric" (fun () -> b.declare_metric d));
+    compose_safe_call ~what:"declare_metric" (fun () -> a.declare_metric d);
+    compose_safe_call ~what:"declare_metric" (fun () -> b.declare_metric d));
 }
 
 (* ------------------------------------------------------------------ *)
 (* Create                                                              *)
 (* ------------------------------------------------------------------ *)
 
-let create ~service ~mono_clock ~backend = {
+let create ~service ~mono_clock ?(on_backend_error = default_backend_error) ~backend () = {
   service;
   get_time = (fun () -> Eio.Time.Mono.now mono_clock);
   backend;
   context = [];
+  on_backend_error;
+  metric_declarations = Hashtbl.create 8;
+  metric_mutex = Mutex.create ();
 }
 
 (* ------------------------------------------------------------------ *)
@@ -190,7 +233,9 @@ let with_span t ?parent name f =
     let end_ns = now_ns t in
     let log_entries = List.rev !(sp.sp_log_buf) in
     sp.sp_closed := true;
-    safe_call ~what:"emit_span" (fun () ->
+    safe_call
+      ~on_error:(report_backend_error t (Emit_span { name }))
+      (fun () ->
       t.backend.emit_span {
         trace_ctx = sp_ctx; name; service = t.service;
         start_ns = sp_start; end_ns;
@@ -328,13 +373,56 @@ let validate_metric_labels ~name ~label_names labels =
       invalid_arg
         (Printf.sprintf "Obs_eio.emit_metric %S: extra label %S" name label)
 
-let emit_metric t event = safe_call ~what:"emit_metric" (fun () -> t.backend.emit_metric event)
+let metric_event_kind (event : metric_event) =
+  match event.kind with
+  | `Counter _ -> `Counter
+  | `Gauge _ -> `Gauge
+  | `Histogram _ -> `Histogram
+
+let emit_metric t event =
+  let kind = metric_event_kind event in
+  safe_call
+    ~on_error:(report_backend_error t (Emit_metric { name = event.name; kind }))
+    (fun () -> t.backend.emit_metric event)
+
+let sorted_label_names names = List.sort String.compare names
+
+let validate_declaration t (d : metric_declaration) =
+  Mutex.lock t.metric_mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock t.metric_mutex) (fun () ->
+    match Hashtbl.find_opt t.metric_declarations d.declaration_name with
+    | None ->
+      Hashtbl.add t.metric_declarations d.declaration_name
+        { d with declaration_label_names = sorted_label_names d.declaration_label_names }
+    | Some existing ->
+      let label_names = sorted_label_names d.declaration_label_names in
+      if existing.declaration_kind <> d.declaration_kind then
+        invalid_arg
+          (Printf.sprintf
+             "Obs_eio.register_metric %S: already registered as %s, got %s"
+             d.declaration_name
+             (string_of_metric_kind existing.declaration_kind)
+             (string_of_metric_kind d.declaration_kind));
+      if existing.declaration_label_names <> label_names then
+        invalid_arg
+          (Printf.sprintf
+             "Obs_eio.register_metric %S: conflicting label names"
+             d.declaration_name);
+      if existing.declaration_help <> d.declaration_help then
+        invalid_arg
+          (Printf.sprintf
+             "Obs_eio.register_metric %S: conflicting help text"
+             d.declaration_name))
 
 let declare_metric t ~name ~help ~kind ~label_names =
-  safe_call ~what:"declare_metric" (fun () ->
-    t.backend.declare_metric
-      { declaration_name = name; declaration_help = help; declaration_kind = kind;
-        declaration_label_names = label_names; declaration_service = t.service })
+  let declaration =
+    { declaration_name = name; declaration_help = help; declaration_kind = kind;
+      declaration_label_names = label_names; declaration_service = t.service }
+  in
+  validate_declaration t declaration;
+  safe_call
+    ~on_error:(report_backend_error t (Declare_metric { name; kind }))
+    (fun () -> t.backend.declare_metric declaration)
 
 let register_counter t ~name ~help ~label_names : counter_fn =
   let name = metric_name name in

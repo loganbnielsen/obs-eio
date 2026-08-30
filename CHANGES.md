@@ -8,6 +8,11 @@
   required by the W3C trace context spec.
 - `Obs_trace.generate` and `Obs_trace.child_span` now avoid the same reserved
   all-zero trace ID and span ID values.
+- `Obs_eio.create` now accepts `?on_backend_error`, a per-handle callback for
+  synchronous backend failures. The callback receives a typed backend operation
+  and is itself protected; cancellation still propagates.
+- Metric registration now rejects conflicting declarations for the same metric
+  name (kind, label names, or help text) before calling the backend.
 
 ## 0.1.0
 

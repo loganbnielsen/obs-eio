@@ -200,7 +200,7 @@ let do_inner_work ~parent ... =
 
 ```ocaml
 let ot = Obs_eio.create ~service:"checkout-api"
-           ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout in
+           ~mono_clock:env#mono_clock ~backend:Obs_eio.stdout () in
 let ot = Obs_eio.with_context ot [("env", "prod"); ("region", "us-east-1")] in
 
 (* Register metrics once at startup *)
