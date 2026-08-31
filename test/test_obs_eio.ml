@@ -536,13 +536,22 @@ let test_metric_name_validation () =
 
 let test_label_name_validation () =
   Alcotest.(check string) "valid label name"
-    "http_status" (Obs_eio.label_name_to_string (Obs_eio.label_name "http_status"));
+    "http_status" (Obs_eio.label_name_to_string (Obs_eio.label_name_exn "http_status"));
   check_invalid_arg "empty label name" (fun () ->
-    ignore (Obs_eio.label_name ""));
+    ignore (Obs_eio.label_name_exn ""));
   check_invalid_arg "label name starting with digit" (fun () ->
-    ignore (Obs_eio.label_name "1status"));
+    ignore (Obs_eio.label_name_exn "1status"));
   check_invalid_arg "label name containing colon" (fun () ->
-    ignore (Obs_eio.label_name "http:status"))
+    ignore (Obs_eio.label_name_exn "http:status"))
+
+let test_label_name_result () =
+  (match Obs_eio.label_name "http_status" with
+   | Ok name -> Alcotest.(check string) "valid label name" "http_status"
+       (Obs_eio.label_name_to_string name)
+   | Error msg -> Alcotest.failf "expected Ok, got Error %S" msg);
+  (match Obs_eio.label_name "1status" with
+   | Ok _ -> Alcotest.fail "expected Error for a name starting with a digit"
+   | Error _ -> ())
 
 let test_register_rejects_invalid_metric_name () =
   Eio_main.run @@ fun env ->
@@ -962,6 +971,7 @@ let () =
       test_case "emit rejects missing extra duplicate labels" `Quick test_emit_rejects_missing_extra_duplicate_labels;
       test_case "metric name validation"       `Quick test_metric_name_validation;
       test_case "label name validation"        `Quick test_label_name_validation;
+      test_case "label name result"            `Quick test_label_name_result;
       test_case "register rejects invalid metric names" `Quick test_register_rejects_invalid_metric_name;
       test_case "register rejects invalid label names" `Quick test_register_rejects_invalid_label_name;
       test_case "register rejects duplicate label names" `Quick test_register_rejects_duplicate_label_names;
