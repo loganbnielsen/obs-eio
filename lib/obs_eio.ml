@@ -56,6 +56,8 @@ type backend_op =
   | Emit_metric of { name : string; kind : metric_kind }
   | Declare_metric of { name : string; kind : metric_kind }
 
+exception Multiple_backend_errors of exn list
+
 type label_name = string
 
 (* ------------------------------------------------------------------ *)
@@ -174,29 +176,33 @@ let safe_call ~on_error f =
   | (Out_of_memory | Stack_overflow | Sys.Break) as exn -> raise exn
   | exn -> on_error exn
 
-let compose_call first_error f =
+let compose_call errors f =
   try f () with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
   | (Out_of_memory | Stack_overflow | Sys.Break) as exn -> raise exn
-  | exn ->
-    if !first_error = None then first_error := Some exn
+  | exn -> errors := exn :: !errors
+
+let raise_compose_errors = function
+  | [] -> ()
+  | [ exn ] -> raise exn
+  | exns -> raise (Multiple_backend_errors exns)
 
 let compose a b = {
   emit_span      = (fun e ->
-    let first_error = ref None in
-    compose_call first_error (fun () -> a.emit_span e);
-    compose_call first_error (fun () -> b.emit_span e);
-    match !first_error with Some exn -> raise exn | None -> ());
+    let errors = ref [] in
+    compose_call errors (fun () -> a.emit_span e);
+    compose_call errors (fun () -> b.emit_span e);
+    raise_compose_errors (List.rev !errors));
   emit_metric    = (fun e ->
-    let first_error = ref None in
-    compose_call first_error (fun () -> a.emit_metric e);
-    compose_call first_error (fun () -> b.emit_metric e);
-    match !first_error with Some exn -> raise exn | None -> ());
+    let errors = ref [] in
+    compose_call errors (fun () -> a.emit_metric e);
+    compose_call errors (fun () -> b.emit_metric e);
+    raise_compose_errors (List.rev !errors));
   declare_metric = (fun d ->
-    let first_error = ref None in
-    compose_call first_error (fun () -> a.declare_metric d);
-    compose_call first_error (fun () -> b.declare_metric d);
-    match !first_error with Some exn -> raise exn | None -> ());
+    let errors = ref [] in
+    compose_call errors (fun () -> a.declare_metric d);
+    compose_call errors (fun () -> b.declare_metric d);
+    raise_compose_errors (List.rev !errors));
 }
 
 (* ------------------------------------------------------------------ *)
