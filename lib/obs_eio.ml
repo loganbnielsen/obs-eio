@@ -325,7 +325,7 @@ let metric_name name =
     ~is_char:is_metric_char
     name
 
-let label_name name =
+let label_name_exn name =
   let name =
     validate_name ~kind:"label_name"
       ~is_initial:is_label_initial_char
@@ -339,6 +339,9 @@ let label_name name =
           own internal use (e.g. __name__)" name);
   name
 
+let label_name name =
+  try Ok (label_name_exn name) with Invalid_argument msg -> Error msg
+
 let label_name_to_string name = name
 
 let duplicate_name names =
@@ -350,7 +353,7 @@ let duplicate_name names =
   loop [] names
 
 let validate_label_names label_names =
-  List.iter (fun name -> ignore (label_name name)) label_names;
+  List.iter (fun name -> ignore (label_name_exn name)) label_names;
   (match duplicate_name label_names with
    | None -> ()
    | Some name ->

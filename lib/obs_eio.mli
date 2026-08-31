@@ -277,11 +277,16 @@ type label_name = private string
     packages that need their own validated, typed label-name selectors (e.g.
     [obs-loki-eio]'s stream-label selection). *)
 
-val label_name : string -> label_name
-(** [label_name name] validates [name] against Prometheus label naming rules
-    and returns it unchanged. Raises [Invalid_argument] on invalid names,
-    including a name starting with ["__"] — that prefix is reserved for
-    Prometheus's own internal use (e.g. [__name__]). *)
+val label_name : string -> (label_name, string) result
+(** [label_name name] validates [name] against Prometheus label naming rules.
+    [Error _] on invalid names, including a name starting with ["__"] — that
+    prefix is reserved for Prometheus's own internal use (e.g. [__name__]). *)
+
+val label_name_exn : string -> label_name
+(** Like [label_name], but raises [Invalid_argument] instead of returning
+    [Error]. Intended for static label-name literals (a source-code
+    constant), not runtime data — same convention as
+    [Kafka_service.topic_name_exn] in the [kafka-eio-service] package. *)
 
 val label_name_to_string : label_name -> string
 (** [label_name_to_string name] returns the validated label name as a string. *)
