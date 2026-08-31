@@ -244,4 +244,4 @@ ignore handle_request
 - Grafana dashboard templates
 - Baggage, tracestate, and other W3C extensions beyond `traceparent` — wrap `Obs_trace.t` in your own type if you need them
 - Sampling decisions — `trace_flags` is set to `\x01` (sampled) by default; a sampling API is deferred
-- Detecting a metric re-registered under the same name with a different label set — each `t`'s `register_*` calls are independent closures with no cross-registration registry at this layer (a backend such as `obs-prometheus-eio` may detect some of this itself)
+- Cross-process metric declaration conflicts — each `t` validates its own metric registrations, while backends such as `obs-prometheus-eio` may add exporter-specific checks.

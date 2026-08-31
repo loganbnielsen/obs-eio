@@ -137,6 +137,11 @@ type backend_op =
   | Declare_metric of { name : string; kind : metric_kind }
 (** Backend operation that failed. Passed to [on_backend_error]. *)
 
+exception Multiple_backend_errors of exn list
+(** Raised by [compose] when both sibling backends fail for the same operation.
+    The containing [Obs_eio.t] catches it and passes it to [on_backend_error]
+    like any other ordinary backend failure. *)
+
 val noop    : backend
 (** Drops all events. Use in tests and CI. *)
 
@@ -146,8 +151,8 @@ val stdout  : backend
 val compose : backend -> backend -> backend
 (** Fan-out to two backends, e.g. [compose prometheus_backend loki_backend].
     Each backend's [emit_span]/[emit_metric]/[declare_metric] is called
-    independently: if one raises, the other backend still receives the event
-    and the first exception is re-raised afterward for [create]'s
+    independently: if one raises, the other backend still receives the event.
+    If both raise, [Multiple_backend_errors] preserves both exceptions for [create]'s
     [on_backend_error] handler. Cancellation and fatal runtime exceptions are
     never caught here (see [backend]'s doc) and propagate immediately, skipping
     the other backend, exactly as an uncaught exception from any other Eio

@@ -750,6 +750,25 @@ let test_compose_isolates_a_raising_sibling () =
   Alcotest.(check int) "sibling still received declare despite a's exception" 1 !declares_b;
   Alcotest.(check int) "composed backend failures reported to owner" 3 !backend_errors
 
+let test_compose_reports_both_sibling_failures () =
+  Eio_main.run @@ fun env ->
+  let backend_errors = ref [] in
+  let backend_a =
+    { Obs_eio.emit_span = (fun _ -> failwith "boom a");
+      emit_metric = (fun _ -> ());
+      declare_metric = noop_declare } in
+  let backend_b =
+    { Obs_eio.emit_span = (fun _ -> failwith "boom b");
+      emit_metric = (fun _ -> ());
+      declare_metric = noop_declare } in
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~on_backend_error:(fun _ exn -> backend_errors := exn :: !backend_errors)
+    ~backend:(Obs_eio.compose backend_a backend_b) () in
+  Obs_eio.with_span ot "op" (fun _sp -> ());
+  match !backend_errors with
+  | [ Obs_eio.Multiple_backend_errors [ _; _ ] ] -> ()
+  | _ -> Alcotest.fail "expected both compose backend failures"
+
 let test_with_span_survives_raising_backend () =
   Eio_main.run @@ fun env ->
   let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
@@ -985,6 +1004,7 @@ let () =
     "compose", [
       test_case "compose fans out to both backends" `Quick test_compose_fans_out;
       test_case "compose isolates a raising sibling backend" `Quick test_compose_isolates_a_raising_sibling;
+      test_case "compose reports both sibling failures" `Quick test_compose_reports_both_sibling_failures;
     ];
     "backend_failure_isolation", [
       test_case "with_span survives a raising backend"        `Quick test_with_span_survives_raising_backend;
