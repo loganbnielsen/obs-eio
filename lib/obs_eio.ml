@@ -17,6 +17,7 @@ type log_entry = {
 
 type span_event = {
   trace_ctx : Obs_trace.t;
+  parent_span_id : int64 option;
   name      : string;
   service   : string;
   start_ns  : int64;
@@ -239,6 +240,7 @@ let with_span t ?parent name f =
     | None   -> Obs_trace.generate ()
     | Some p -> Obs_trace.child_span p
   in
+  let parent_span_id = Option.map (fun p -> p.Obs_trace.span_id) parent in
   let sp_start = now_ns t in
   let sp = { sp_ctx; sp_log_buf = ref []; sp_closed = ref false; sp_now = (fun () -> now_ns t) } in
   (* Not Fun.protect: its ~finally wraps any raised exception, including
@@ -252,7 +254,7 @@ let with_span t ?parent name f =
       ~on_error:(report_backend_error t (Emit_span { name }))
       (fun () ->
       t.backend.emit_span {
-        trace_ctx = sp_ctx; name; service = t.service;
+        trace_ctx = sp_ctx; parent_span_id; name; service = t.service;
         start_ns = sp_start; end_ns;
         status;
         log_entries;

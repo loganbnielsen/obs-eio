@@ -385,6 +385,45 @@ let test_log_t_uses_parent () =
   Alcotest.(check bool) "log_standalone's span shares the parent trace_id"
     true (parent.Obs_trace.trace_id = (List.hd !spans).Obs_eio.trace_ctx.Obs_trace.trace_id)
 
+let test_with_span_sets_parent_span_id () =
+  Eio_main.run @@ fun env ->
+  let spans = ref [] in
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun e -> spans := e :: !spans);
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } () in
+  let parent = Obs_trace.generate () in
+  Obs_eio.with_span ot ~parent "child" (fun _sp -> ());
+  Alcotest.(check bool) "parent_span_id is the parent's span_id"
+    true ((List.hd !spans).Obs_eio.parent_span_id = Some parent.Obs_trace.span_id)
+
+let test_with_span_no_parent_has_no_parent_span_id () =
+  Eio_main.run @@ fun env ->
+  let spans = ref [] in
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun e -> spans := e :: !spans);
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } () in
+  Obs_eio.with_span ot "root" (fun _sp -> ());
+  Alcotest.(check bool) "root span has no parent_span_id"
+    true ((List.hd !spans).Obs_eio.parent_span_id = None)
+
+(* Pins the design guidance directly: with_context's key/value pairs land in
+   span_event.context (searchable metadata) and never influence
+   parent_span_id (structural trace-graph data) — the two are unrelated
+   channels, even when a span has both a parent and ambient context. *)
+let test_with_context_does_not_set_parent_span_id () =
+  Eio_main.run @@ fun env ->
+  let spans = ref [] in
+  let ot = Obs_eio.create ~service:"svc" ~mono_clock:env#mono_clock
+    ~backend:{ Obs_eio.emit_span = (fun e -> spans := e :: !spans);
+               emit_metric = (fun _ -> ()); declare_metric = noop_declare } () in
+  let ot = Obs_eio.with_context ot [ ("request_id", "r-1") ] in
+  Obs_eio.with_span ot "root" (fun _sp -> ());
+  let emitted = List.hd !spans in
+  Alcotest.(check bool) "context carries the with_context pair"
+    true (List.mem ("request_id", "r-1") emitted.Obs_eio.context);
+  Alcotest.(check bool) "no parent was given, so parent_span_id is still None"
+    true (emitted.Obs_eio.parent_span_id = None)
+
 (* ------------------------------------------------------------------ *)
 (* Metrics                                                             *)
 (* ------------------------------------------------------------------ *)
@@ -979,6 +1018,9 @@ let () =
       test_case "current_trace_context child of parent" `Quick test_current_trace_ctx_child_of_parent;
       test_case "root span has valid traceparent" `Quick test_with_span_no_parent_generates_root;
       test_case "log_standalone uses ?parent"               `Quick test_log_t_uses_parent;
+      test_case "with_span sets parent_span_id from ?parent" `Quick test_with_span_sets_parent_span_id;
+      test_case "root span has no parent_span_id" `Quick test_with_span_no_parent_has_no_parent_span_id;
+      test_case "with_context does not set parent_span_id" `Quick test_with_context_does_not_set_parent_span_id;
     ];
     "metrics", [
       test_case "counter emits metric event"   `Quick test_counter_emits_event;
