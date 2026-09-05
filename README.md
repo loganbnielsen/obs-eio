@@ -82,6 +82,7 @@ type log_entry = {
 
 type span_event = {
   trace_ctx   : Obs_trace.t;
+  parent_span_id : int64 option;
   name        : string;
   service     : string;
   start_ns    : int64;

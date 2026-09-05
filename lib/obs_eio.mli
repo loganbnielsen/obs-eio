@@ -55,6 +55,12 @@ type log_entry = {
 
 type span_event = {
   trace_ctx : Obs_trace.t;
+  parent_span_id : int64 option;
+  (** [Some parent.span_id] when {!with_span}/{!log_standalone} was called
+      with [?parent]; [None] for a root span. Structural trace-graph data —
+      distinct from [context], which is searchable metadata, not parentage.
+      A backend that can render a waterfall (e.g. OTLP's [parent_span_id])
+      maps this directly; one that can't (Loki, Prometheus) ignores it. *)
   name      : string;
   service   : string;
   start_ns  : int64;  (** monotonic nanoseconds from [Eio.Time.Mono.now] *)
